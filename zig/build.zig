@@ -4,13 +4,37 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const lib = b.addStaticLibrary(.{
-        .name = "compositor",
+    const mod = b.addModule("compositor", .{
         .root_source_file = b.path("compositor.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
-    lib.linkLibC();
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "compositor",
+        .root_module = mod,
+    });
+
     b.installArtifact(lib);
+
+    // Zig unit tests.
+    const ansi_test_mod = b.addModule("ansi_test", .{
+        .root_source_file = b.path("ansi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const ansi_tests = b.addTest(.{ .root_module = ansi_test_mod });
+
+    const rw_test_mod = b.addModule("runewidth_test", .{
+        .root_source_file = b.path("runewidth.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const runewidth_tests = b.addTest(.{ .root_module = rw_test_mod });
+
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(ansi_tests).step);
+    test_step.dependOn(&b.addRunArtifact(runewidth_tests).step);
 }
