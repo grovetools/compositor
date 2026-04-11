@@ -1,11 +1,11 @@
 const std = @import("std");
-const ansi = @import("ansi.zig");
-const runewidth = @import("runewidth.zig");
+pub const ansi = @import("ansi.zig");
+pub const runewidth = @import("runewidth.zig");
 
 // --- Logging ---
 
 // Log levels matching compositor.h defines.
-const LogLevel = enum(c_int) {
+pub const LogLevel = enum(c_int) {
     trace = 0,
     debug = 1,
     info = 2,
@@ -16,7 +16,7 @@ const LogLevel = enum(c_int) {
 // Callback into Go's groveCompositorLog export.
 extern fn groveCompositorLog(level: c_int, msg: [*]const u8, length: usize) void;
 
-fn compositorLog(min_level: LogLevel, level: LogLevel, comptime fmt_str: []const u8, args: anytype) void {
+pub fn compositorLog(min_level: LogLevel, level: LogLevel, comptime fmt_str: []const u8, args: anytype) void {
     if (@intFromEnum(level) < @intFromEnum(min_level)) return;
     var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt_str, args) catch &buf;
@@ -35,7 +35,7 @@ const CompositorStats = extern struct {
 
 // --- Cell buffer ---
 
-const Cell = struct {
+pub const Cell = struct {
     codepoint: u32 = ' ',
     fg: ansi.Color = .{},
     bg: ansi.Color = .{},
@@ -452,7 +452,7 @@ export fn compositor_pointer(c: *Compositor) *anyopaque {
 }
 
 // Inline cell comparison (all fields).
-inline fn cellEqual(a: Cell, b: Cell) bool {
+pub inline fn cellEqual(a: Cell, b: Cell) bool {
     return a.codepoint == b.codepoint and
         a.fg.eql(b.fg) and a.bg.eql(b.bg) and
         a.bold == b.bold and a.italic == b.italic and a.underline == b.underline and
