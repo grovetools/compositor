@@ -40,11 +40,11 @@ func WithLogLevel(level int) Option {
 
 // NewModel wraps a child tea.Model with compositor rendering.
 // The compositor is created on the first WindowSizeMsg and freed on quit.
-// Default log level is LogInfo; override with WithLogLevel().
+// Default log level is LogWarn; override with WithLogLevel().
 func NewModel(child tea.Model, opts ...Option) *Model {
 	m := &Model{
 		child:    child,
-		logLevel: LogInfo,
+		logLevel: LogWarn,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -108,6 +108,12 @@ func (m *Model) Free() {
 		m.comp.Free()
 		m.comp = nil
 	}
+}
+
+// Unwrap returns the underlying child tea.Model. Use this after
+// tea.Program.Run() to recover the original model for post-exit inspection.
+func (m *Model) Unwrap() tea.Model {
+	return m.child
 }
 
 // Compositor returns the underlying Compositor, or nil if not yet created.
