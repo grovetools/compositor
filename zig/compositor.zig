@@ -97,7 +97,7 @@ export fn compositor_new(width: c_int, height: c_int, log_level: c_int) ?*Compos
         .log_level = lvl,
     };
 
-    @memset(c.front, Cell{});
+    @memset(c.front, Cell{ .codepoint = 0xFFFFFFFF });
     @memset(c.back, Cell{});
 
     compositorLog(lvl, .info, "compositor_new: width={d} height={d} log_level={d}", .{ w, h, log_level });
@@ -121,7 +121,7 @@ export fn compositor_resize(c: *Compositor, width: c_int, height: c_int) void {
     if (w == c.width and h == c.height) {
         // Force a full redraw when receiving a resize event with identical dimensions.
         // Crucial when recovering from external editors/ephemeral panes.
-        @memset(c.front, Cell{});
+        @memset(c.front, Cell{ .codepoint = 0xFFFFFFFF });
         return;
     }
 
@@ -135,7 +135,7 @@ export fn compositor_resize(c: *Compositor, width: c_int, height: c_int) void {
     c.front = c.allocator.alloc(Cell, size) catch @panic("OOM");
     c.back = c.allocator.alloc(Cell, size) catch @panic("OOM");
     // Force full redraw on resize by making front != back.
-    @memset(c.front, Cell{});
+    @memset(c.front, Cell{ .codepoint = 0xFFFFFFFF });
     @memset(c.back, Cell{});
 }
 
@@ -225,6 +225,11 @@ export fn compositor_flush(c: *Compositor, fd: c_int) void {
 
     // Active SGR state tracking — start at terminal defaults.
     var active = Cell{};
+    // Cursor position tracking to skip redundant CUP sequences.
+    var current_y: usize = 9999;
+    var current_x: usize = 9999;
+    // Emit a single SGR reset at the start of flush (not per-cell).
+    var sgr_emitted = false;
 
     for (0..c.height) |y| {
         for (0..c.width) |x| {
@@ -244,12 +249,17 @@ export fn compositor_flush(c: *Compositor, fd: c_int) void {
 
             const writer = out.writer(alloc);
 
-            // CUP: move cursor (1-based ANSI).
-            writer.print("\x1b[{d};{d}H", .{ y + 1, x + 1 }) catch @panic("OOM");
+            // Emit SGR reset once at the start of flush.
+            if (!sgr_emitted) {
+                writer.writeAll("\x1b[0m") catch @panic("OOM");
+                active = Cell{};
+                sgr_emitted = true;
+            }
 
-            // Reset SGR state after CUP jump.
-            writer.writeAll("\x1b[0m") catch @panic("OOM");
-            active = Cell{};
+            // Only emit CUP if the cursor isn't already at the target position.
+            if (y != current_y or x != current_x) {
+                writer.print("\x1b[{d};{d}H", .{ y + 1, x + 1 }) catch @panic("OOM");
+            }
 
             // Determine if any attribute needs to be turned OFF.
             const needs_reset = (active.bold and !back.bold) or
@@ -319,6 +329,10 @@ export fn compositor_flush(c: *Compositor, fd: c_int) void {
                 if (len == 1 and buf[0] == 0) buf[0] = ' ';
                 writer.writeAll(buf[0..len]) catch @panic("OOM");
             }
+
+            // Update cursor position tracker.
+            current_y = y;
+            current_x = x + (if (back.wide) @as(usize, 2) else 1);
 
             // Update front buffer.
             c.front[idx] = back;
