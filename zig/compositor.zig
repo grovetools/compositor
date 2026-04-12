@@ -118,7 +118,12 @@ export fn compositor_free(c: *Compositor) void {
 export fn compositor_resize(c: *Compositor, width: c_int, height: c_int) void {
     const w: usize = @intCast(width);
     const h: usize = @intCast(height);
-    if (w == c.width and h == c.height) return;
+    if (w == c.width and h == c.height) {
+        // Force a full redraw when receiving a resize event with identical dimensions.
+        // Crucial when recovering from external editors/ephemeral panes.
+        @memset(c.front, Cell{});
+        return;
+    }
 
     compositorLog(c.log_level, .info, "compositor_resize: {d}x{d} -> {d}x{d}", .{ c.width, c.height, w, h });
 
