@@ -66,7 +66,7 @@ type frameState struct {
 
 func generateItems() []string {
 	ecosystems := []string{"grovetools", "myapp", "infra", "platform", "analytics"}
-	projects := []string{"core", "nav", "terminal", "compositor", "flow", "daemon", "tend", "cx", "nb", "hooks"}
+	projects := []string{"core", "nav", "treemux", "compositor", "flow", "daemon", "tend", "cx", "nb", "hooks"}
 	branches := []string{"main", "feat/new-ui", "fix/crash", "refactor/cleanup", "chore/deps"}
 	statuses := []string{"clean", "modified", "ahead 3", "behind 1", "diverged"}
 
