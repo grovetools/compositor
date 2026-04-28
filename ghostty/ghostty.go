@@ -48,7 +48,17 @@ import (
 	"io"
 	"sync"
 	"unsafe"
+
+	"github.com/mattn/go-runewidth"
 )
+
+func runeWidth(r rune) int {
+	w := runewidth.RuneWidth(r)
+	if w < 1 {
+		return 1
+	}
+	return w
+}
 
 // registry maps C userdata pointers back to Terminal instances.
 var (
@@ -98,6 +108,12 @@ type Terminal struct {
 	mu         sync.Mutex
 	ptyWriter  io.Writer // for writing responses back to PTY (local *os.File or remote WS)
 	registryID uintptr   // ID in the global registry for C callbacks
+
+	// Render state for copy-mode grid access (lazy-initialized).
+	renderState   C.GhosttyRenderState
+	rowIter       C.GhosttyRenderStateRowIterator
+	rowCells      C.GhosttyRenderStateRowCells
+	renderInited  bool
 }
 
 // New creates a new ghostty terminal with the given dimensions.
@@ -541,10 +557,86 @@ func (t *Terminal) UnsafePointer() unsafe.Pointer {
 	return unsafe.Pointer(t.terminal)
 }
 
+// initRenderState lazily creates the render state objects for grid access.
+// Must be called with t.mu held.
+func (t *Terminal) initRenderState() {
+	if t.renderInited {
+		return
+	}
+	C.ghostty_render_state_new(nil, &t.renderState)
+	C.ghostty_render_state_row_iterator_new(nil, &t.rowIter)
+	C.ghostty_render_state_row_cells_new(nil, &t.rowCells)
+	t.renderInited = true
+}
+
+// GetVisualRow returns the viewport row at index y as a []rune slice where
+// each index corresponds to a visual column. Wide characters (width 2) are
+// followed by a padding space so that len(result) == terminal width.
+func (t *Terminal) GetVisualRow(y int) []rune {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.initRenderState()
+
+	C.ghostty_render_state_update(t.renderState, t.terminal)
+	C.ghostty_render_state_get(t.renderState, C.GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
+		unsafe.Pointer(&t.rowIter))
+
+	// Advance iterator to row y.
+	for i := 0; i <= y; i++ {
+		if !bool(C.ghostty_render_state_row_iterator_next(t.rowIter)) {
+			return make([]rune, t.cols)
+		}
+	}
+
+	C.ghostty_render_state_row_get(t.rowIter, C.GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
+		unsafe.Pointer(&t.rowCells))
+
+	row := make([]rune, 0, t.cols)
+	for C.ghostty_render_state_row_cells_next(t.rowCells) {
+		var graphemeLen C.uint32_t
+		C.ghostty_render_state_row_cells_get(t.rowCells,
+			C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, unsafe.Pointer(&graphemeLen))
+
+		var cp rune = ' '
+		if graphemeLen > 0 {
+			var codepoints [16]C.uint32_t
+			C.ghostty_render_state_row_cells_get(t.rowCells,
+				C.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, unsafe.Pointer(&codepoints[0]))
+			cp = rune(codepoints[0])
+		}
+
+		row = append(row, cp)
+		if runeWidth(cp) == 2 {
+			row = append(row, ' ')
+		}
+
+		if len(row) >= t.cols {
+			break
+		}
+	}
+
+	// Pad to full width if needed.
+	for len(row) < t.cols {
+		row = append(row, ' ')
+	}
+	return row[:t.cols]
+}
+
+// Cols returns the terminal width.
+func (t *Terminal) Cols() int {
+	return t.cols
+}
+
 // Close frees all ghostty resources.
 func (t *Terminal) Close() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.renderInited {
+		C.ghostty_render_state_row_cells_free(t.rowCells)
+		C.ghostty_render_state_row_iterator_free(t.rowIter)
+		C.ghostty_render_state_free(t.renderState)
+		t.renderInited = false
+	}
 	if t.registryID != 0 {
 		unregisterTerminal(t.registryID)
 		t.registryID = 0
