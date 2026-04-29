@@ -18,6 +18,15 @@ type LocalBackend struct {
 // directory, returning a LocalBackend that implements Backend.
 func StartLocal(dir string, rows, cols uint16, environ []string) (*LocalBackend, error) {
 	shell := os.Getenv("SHELL")
+	// Prefer SHELL from the passed environ (caller's environment) over
+	// the process-level env, since the daemon may have inherited a
+	// different shell than the user's login shell.
+	for _, e := range environ {
+		if len(e) > 6 && e[:6] == "SHELL=" {
+			shell = e[6:]
+			break
+		}
+	}
 	if shell == "" {
 		shell = "/bin/sh"
 	}
