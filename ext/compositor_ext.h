@@ -15,6 +15,9 @@
 extern "C" {
 #endif
 
+// Back buffer clear — wipe all cells to default spaces.
+void ext_clear(void* c_ptr);
+
 // Extension lifecycle (manages global state for ghostty cache, diff, input).
 void ext_init(void);
 void ext_free(void);

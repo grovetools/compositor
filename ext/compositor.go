@@ -131,6 +131,13 @@ func (c *Compositor) GetStats() Stats {
 	}
 }
 
+// Clear fills the back buffer with default blank cells.
+func (c *Compositor) Clear() {
+	if c.Compositor != nil {
+		C.ext_clear(c.Pointer())
+	}
+}
+
 // BlitGhostty reads cell data from a ghostty terminal's render state
 // and writes it into the back buffer at the given pane coordinates.
 func (c *Compositor) BlitGhostty(termPtr unsafe.Pointer, x, y, w, h int) {

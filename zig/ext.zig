@@ -83,6 +83,16 @@ fn initSized(comptime T: type) T {
     return val;
 }
 
+// --- Back buffer clear ---
+
+export fn ext_clear(c_ptr: *anyopaque) void {
+    const c: *Compositor = @ptrCast(@alignCast(c_ptr));
+    const default_cell = Cell{};
+    for (c.back) |*cell| {
+        cell.* = default_cell;
+    }
+}
+
 // --- Extension lifecycle ---
 
 export fn ext_init() void {
