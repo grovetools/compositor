@@ -5,11 +5,17 @@ package ghostty
 #cgo LDFLAGS: -L${SRCDIR}/../lib/ghostty/lib -lghostty-vt -lc++ -framework CoreFoundation
 
 #include <ghostty/vt.h>
+#include <ghostty/vt/sys.h>
 #include <stdlib.h>
 #include <string.h>
 
 // Defined in effects.c
 extern void ghostty_setup_effects(GhosttyTerminal term, void* userdata);
+
+// Silence libghostty logging (page_list info messages corrupt terminal).
+static inline void silence_ghostty_logs(void) {
+    ghostty_sys_set(GHOSTTY_SYS_OPT_LOG, NULL);
+}
 
 // Helper: CGo can't set union fields directly.
 static GhosttyTerminalScrollViewport scroll_viewport_delta(intptr_t delta) {
@@ -96,6 +102,10 @@ func goWritePTYCallback(userdata unsafe.Pointer, data *C.uint8_t, length C.size_
 	}
 	buf := C.GoBytes(unsafe.Pointer(data), C.int(length))
 	_, _ = t.ptyWriter.Write(buf)
+}
+
+func init() {
+	C.silence_ghostty_logs()
 }
 
 // Terminal wraps a libghostty-vt terminal instance.
