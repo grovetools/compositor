@@ -24,6 +24,8 @@ $(GHOSTTY_LIB) $(GHOSTTY_HEADER):
 		rm -rf $(GHOSTTY_BUILD_DIR); \
 		git clone --depth 1 $(GHOSTTY_REPO) $(GHOSTTY_BUILD_DIR); \
 	fi
+	@# Suppress Zig std.log info messages (page_list) that corrupt terminal rendering.
+	@sed -i '' 's/break :options .{};/break :options .{ .log_level = .err };/' $(GHOSTTY_BUILD_DIR)/src/lib_vt.zig
 	@cd $(GHOSTTY_BUILD_DIR) && zig build -Demit-lib-vt=true -Doptimize=ReleaseFast
 	@cp $(GHOSTTY_BUILD_DIR)/zig-out/lib/libghostty-vt.a $(VENDOR_DIR)/lib/
 	@cp -R $(GHOSTTY_BUILD_DIR)/zig-out/include/ghostty $(VENDOR_DIR)/include/
