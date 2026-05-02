@@ -5,6 +5,7 @@ import (
 	"os/exec"
 
 	creackpty "github.com/creack/pty"
+	"golang.org/x/sys/unix"
 )
 
 // LocalBackend wraps a local creack/pty master fd and child process.
@@ -42,6 +43,7 @@ func StartLocal(dir string, rows, cols uint16, environ []string) (*LocalBackend,
 	if err != nil {
 		return nil, err
 	}
+	disableFlowControl(ptmx)
 
 	return &LocalBackend{ptmx: ptmx, cmd: cmd}, nil
 }
@@ -56,6 +58,7 @@ func StartLocalCommand(cmd *exec.Cmd, rows, cols uint16) (*LocalBackend, error) 
 	if err != nil {
 		return nil, err
 	}
+	disableFlowControl(ptmx)
 	return &LocalBackend{ptmx: ptmx, cmd: cmd}, nil
 }
 
@@ -87,4 +90,16 @@ func (b *LocalBackend) Pid() int {
 
 func (b *LocalBackend) Fd() uintptr {
 	return b.ptmx.Fd()
+}
+
+// disableFlowControl clears XON/XOFF flow control on the PTY so that
+// ctrl+s/ctrl+q pass through as normal key input.
+func disableFlowControl(f *os.File) {
+	fd := int(f.Fd())
+	termios, err := unix.IoctlGetTermios(fd, unix.TIOCGETA)
+	if err != nil {
+		return
+	}
+	termios.Iflag &^= unix.IXON | unix.IXOFF | unix.IXANY
+	_ = unix.IoctlSetTermios(fd, unix.TIOCSETA, termios)
 }
