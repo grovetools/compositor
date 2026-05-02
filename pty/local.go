@@ -34,7 +34,7 @@ func StartLocal(dir string, rows, cols uint16, environ []string) (*LocalBackend,
 
 	cmd := exec.Command(shell)
 	cmd.Dir = dir
-	cmd.Env = append(environ, "TERM=xterm-256color", "GROVE_TERMINAL=1")
+	cmd.Env = append(environ, "TERM=xterm-256color")
 
 	ptmx, err := creackpty.StartWithSize(cmd, &creackpty.Winsize{
 		Rows: rows,
