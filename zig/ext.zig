@@ -344,6 +344,9 @@ export fn ext_blit_ghostty(
                             .wide_spacer = true,
                         };
                     }
+                    // Skip the ghostty spacer cell that follows a wide character
+                    col_idx += 1;
+                    _ = vt.ghostty_render_state_row_cells_next(ctx.cells);
                 }
             }
             col_idx += 1;
