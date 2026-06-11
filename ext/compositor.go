@@ -203,17 +203,41 @@ func (c *Compositor) checkAndDumpState() {
 		return // Trigger file not present
 	}
 
-	// Trigger file exists; create dump directory with timestamp
-	ts := time.Now().UnixNano()
-	dumpDir := fmt.Sprintf("%s/.local/state/grove/tty-dump-%d", home, ts)
+	// Delete the trigger file first (best-effort)
+	_ = os.Remove(triggerFile)
 
-	// Create the dump directory
-	if err := os.MkdirAll(dumpDir, 0o755); err != nil {
+	c.dumpState()
+}
+
+// DumpStateNow captures the compositor buffers and ghostty grids
+// immediately, for hosts that want to snapshot state at a meaningful
+// moment (e.g. treemux dumps right before the C-g e full-relayout
+// "heal", preserving the pre-heal front/back buffers). No-op unless
+// GROVE_TTY_AUDIT is enabled. Takes the TTY mutex so the dump is
+// atomic with respect to blits and flushes.
+func (c *Compositor) DumpStateNow() {
+	if ttyAuditor == nil || c.Compositor == nil {
+		return
+	}
+	ttyMu.Lock()
+	defer ttyMu.Unlock()
+	c.dumpState()
+}
+
+// dumpState writes the buffer/grid dump. Callers hold ttyMu (Flush path
+// already does; DumpStateNow acquires it).
+func (c *Compositor) dumpState() {
+	home, err := os.UserHomeDir()
+	if err != nil {
 		return
 	}
 
-	// Delete the trigger file first (best-effort)
-	_ = os.Remove(triggerFile)
+	ts := time.Now().UnixNano()
+	dumpDir := fmt.Sprintf("%s/.local/state/grove/tty-dump-%d", home, ts)
+
+	if err := os.MkdirAll(dumpDir, 0o755); err != nil {
+		return
+	}
 
 	// Call ext_dump_state to dump compositor buffers
 	cDumpDir := C.CString(dumpDir)
