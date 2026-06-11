@@ -331,8 +331,22 @@ export fn compositor_flush(c: *Compositor, fd: c_int) void {
             }
 
             // Update cursor position tracker.
+            //
+            // Only trust implicit cursor advancement for plain ASCII. For any
+            // non-ASCII glyph the REAL terminal may advance by a different
+            // width than we computed (emoji, ambiguous-width, ZWJ sequences,
+            // spinner/todo symbols in agent output) — if our assumption is
+            // wrong, every subsequent skipped-CUP cell in the run lands
+            // shifted on the physical screen while the front buffer believes
+            // it's correct: persistent drift/duplication until a full
+            // repaint. Poisoning the tracker forces an explicit CUP for the
+            // next cell, which costs a few bytes but is always correct.
             current_y = y;
-            current_x = x + (if (back.wide) @as(usize, 2) else 1);
+            if (back.codepoint < 0x80) {
+                current_x = x + 1;
+            } else {
+                current_x = 9999; // unknown — force CUP on next cell
+            }
 
             // Update front buffer.
             c.front[idx] = back;
