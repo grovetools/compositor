@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"unsafe"
 
 	comp "github.com/grovetools/compositor"
@@ -155,6 +156,82 @@ func (c *Compositor) BlitGhostty(termPtr unsafe.Pointer, x, y, w, h int) {
 	}
 	C.ext_blit_ghostty(c.Pointer(), termPtr, C.int(x), C.int(y), C.int(w), C.int(h))
 	ghostty.UnlockByPointer(termPtr)
+}
+
+// ttyMu serializes all byte writes to the terminal fd. Two writers share
+// the output tty: the Zig compositor (compositor_flush does a raw write(2)
+// from Flush below) and bubbletea's renderer goroutine (cursor hide/show
+// and chrome frames via its output writer). Without a shared lock the
+// kernel interleaves their escape sequences mid-stream, which both mangles
+// the screen and desyncs the compositor's front buffer from the physical
+// terminal (a mangled-in-transit frame never paints, but the front buffer
+// was already updated, so the diff skips those cells until a full
+// invalidate). Host apps must route every other tty writer through
+// SerializedWriter (or hold TTYLock) so a whole compositor frame is atomic.
+var ttyMu sync.Mutex
+
+// TTYLock returns the mutex that serializes writes to the terminal fd.
+// Hold it for any direct tty write that may race with Flush.
+func TTYLock() *sync.Mutex {
+	return &ttyMu
+}
+
+// Flush writes only changed cells to the given file descriptor, holding
+// the TTY write mutex for the entire C compositor_flush call so the frame
+// is atomic with respect to other serialized writers (see ttyMu).
+// This shadows the embedded base Compositor.Flush.
+func (c *Compositor) Flush(fd int) {
+	if c.Compositor == nil {
+		return
+	}
+	ttyMu.Lock()
+	c.Compositor.Flush(fd)
+	ttyMu.Unlock()
+}
+
+// SerializedWriter wraps w so each Write holds the shared TTY mutex,
+// serializing it against compositor Flush frames. Pass the result to
+// tea.WithOutput so bubbletea's renderer cannot interleave escape
+// sequences with the Zig compositor's raw write(2).
+//
+// The returned writer also exposes Read, Close, and Fd by delegating to w
+// when supported: bubbletea type-asserts its output to term.File
+// (io.ReadWriteCloser + Fd) to detect the TTY, query its size, and
+// restore termios state — a plain io.Writer would silently disable
+// window-size handling.
+func SerializedWriter(w io.Writer) io.Writer {
+	return &serializedTTY{w: w}
+}
+
+type serializedTTY struct {
+	w io.Writer
+}
+
+func (s *serializedTTY) Write(p []byte) (int, error) {
+	ttyMu.Lock()
+	defer ttyMu.Unlock()
+	return s.w.Write(p)
+}
+
+func (s *serializedTTY) Read(p []byte) (int, error) {
+	if r, ok := s.w.(io.Reader); ok {
+		return r.Read(p)
+	}
+	return 0, io.EOF
+}
+
+func (s *serializedTTY) Close() error {
+	if c, ok := s.w.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
+func (s *serializedTTY) Fd() uintptr {
+	if f, ok := s.w.(interface{ Fd() uintptr }); ok {
+		return f.Fd()
+	}
+	return ^uintptr(0) // invalid fd: term.IsTerminal fails cleanly
 }
 
 // UnregisterTerminal removes cached render state for a terminal.
