@@ -44,9 +44,11 @@ static GhosttyPoint make_screen_point(uint16_t x, uint32_t y) {
 }
 */
 import "C"
+
 import (
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"unsafe"
 
@@ -151,10 +153,10 @@ type Terminal struct {
 	registryID uintptr   // ID in the global registry for C callbacks
 
 	// Render state for copy-mode grid access (lazy-initialized).
-	renderState   C.GhosttyRenderState
-	rowIter       C.GhosttyRenderStateRowIterator
-	rowCells      C.GhosttyRenderStateRowCells
-	renderInited  bool
+	renderState  C.GhosttyRenderState
+	rowIter      C.GhosttyRenderStateRowIterator
+	rowCells     C.GhosttyRenderStateRowCells
+	renderInited bool
 }
 
 // New creates a new ghostty terminal with the given dimensions.
@@ -708,3 +710,22 @@ func (t *Terminal) Close() {
 	}
 }
 
+// DumpAllGrids writes a plain-text snapshot of every registered terminal's
+// visible grid into dir (grid-<ptr>.txt), for desync diagnosis alongside the
+// compositor's back/front buffer dumps. Takes each terminal's mutex per the
+// UnsafePointer contract; safe to call from the render path (small grids,
+// rare invocation).
+func DumpAllGrids(dir string) {
+	ptrRegistryMu.Lock()
+	terms := make(map[unsafe.Pointer]*Terminal, len(ptrRegistry))
+	for p, t := range ptrRegistry {
+		terms[p] = t
+	}
+	ptrRegistryMu.Unlock()
+
+	for p, t := range terms {
+		text := t.FormatScreenPlain()
+		name := fmt.Sprintf("%s/grid-%016x.txt", dir, uintptr(p))
+		_ = os.WriteFile(name, []byte(text), 0o644)
+	}
+}

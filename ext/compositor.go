@@ -8,6 +8,7 @@ package ext
 #include <stdlib.h>
 */
 import "C"
+
 import (
 	"fmt"
 	"io"
@@ -244,8 +245,9 @@ func (c *Compositor) dumpState() {
 	defer C.free(unsafe.Pointer(cDumpDir))
 	C.ext_dump_state(c.Pointer(), cDumpDir)
 
-	// Dump all ghostty grids registered with the extension
-	C.ext_dump_all_grids(cDumpDir)
+	// Dump all ghostty grids registered with the Go-side registry
+	// (FormatScreenPlain under each terminal's mutex).
+	ghostty.DumpAllGrids(dumpDir)
 }
 
 // Flush writes only changed cells to the given file descriptor, holding
@@ -470,11 +472,9 @@ func (c *Compositor) AddInterceptSequence(seq []byte) {
 // TTY Write Audit Instrumentation (GROVE_TTY_AUDIT)
 // ============================================================================
 
-var (
-	// ttyAuditor is initialized once by InitTTYAudit if GROVE_TTY_AUDIT is set.
-	// Check ttyAuditor != nil in hot paths instead of a separate flag.
-	ttyAuditor *TTYAuditor
-)
+// ttyAuditor is initialized once by InitTTYAudit if GROVE_TTY_AUDIT is set.
+// Check ttyAuditor != nil in hot paths instead of a separate flag.
+var ttyAuditor *TTYAuditor
 
 func init() {
 	// Initialize TTY auditor from environment on package load.
@@ -493,19 +493,19 @@ func init() {
 	}
 
 	ttyAuditor = &TTYAuditor{
-		path:                    auditPath,
-		lastWriterEndedMidSeq:   false,
+		path:                  auditPath,
+		lastWriterEndedMidSeq: false,
 	}
 }
 
 // TTYAuditor logs TTY write events to a side file for race condition diagnosis.
 type TTYAuditor struct {
-	path                    string
-	file                    *os.File
-	fileMu                  sync.Mutex
-	lastWriterEndedMidSeq   bool
-	lastWriterID            string
-	escapeState             int // 0=normal, 1=ESC seen, 2=CSI/OSC seen
+	path                  string
+	file                  *os.File
+	fileMu                sync.Mutex
+	lastWriterEndedMidSeq bool
+	lastWriterID          string
+	escapeState           int // 0=normal, 1=ESC seen, 2=CSI/OSC seen
 }
 
 // escapeSequenceState returns 0 if chunk ends in normal state,

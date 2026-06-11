@@ -683,10 +683,14 @@ export fn ext_dump_state(c_ptr: *anyopaque, dir_path: [*:0]const u8) c_int {
     const c: *Compositor = @ptrCast(@alignCast(c_ptr));
     const dir_slice = std.mem.span(dir_path);
 
-    // Create directory if it doesn't exist
-    std.fs.makeDirAbsolute(dir_slice) catch |err| {
-        compositorLog(c.log_level, .warn, "dump_state: mkdir failed: {}", .{err});
-        return 1;
+    // Create directory if it doesn't exist (the Go caller usually has
+    // already created it — that must not abort the dump).
+    std.fs.makeDirAbsolute(dir_slice) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
+            compositorLog(c.log_level, .warn, "dump_state: mkdir failed: {}", .{err});
+            return 1;
+        },
     };
 
     var dir = std.fs.openDirAbsolute(dir_slice, .{}) catch |err| {
