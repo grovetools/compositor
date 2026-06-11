@@ -15,6 +15,7 @@ import (
 	"unsafe"
 
 	comp "github.com/grovetools/compositor"
+	"github.com/grovetools/compositor/ghostty"
 	grovelogging "github.com/grovetools/core/logging"
 )
 
@@ -140,10 +141,20 @@ func (c *Compositor) Clear() {
 
 // BlitGhostty reads cell data from a ghostty terminal's render state
 // and writes it into the back buffer at the given pane coordinates.
+//
+// The terminal's mutex is held for the duration of the C call: the blit
+// iterates the ghostty cell grid, which is mutated concurrently by WriteVT
+// on the PTY reader goroutine. Without the lock the blit can observe a
+// half-applied VT write (torn cells interleaving two text generations).
 func (c *Compositor) BlitGhostty(termPtr unsafe.Pointer, x, y, w, h int) {
-	if c.Compositor != nil && termPtr != nil {
-		C.ext_blit_ghostty(c.Pointer(), termPtr, C.int(x), C.int(y), C.int(w), C.int(h))
+	if c.Compositor == nil || termPtr == nil {
+		return
 	}
+	if !ghostty.LockByPointer(termPtr) {
+		return // unknown or closed terminal
+	}
+	C.ext_blit_ghostty(c.Pointer(), termPtr, C.int(x), C.int(y), C.int(w), C.int(h))
+	ghostty.UnlockByPointer(termPtr)
 }
 
 // UnregisterTerminal removes cached render state for a terminal.

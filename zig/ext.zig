@@ -264,7 +264,26 @@ export fn ext_blit_ghostty(
     // 4. Populate the row iterator.
     _ = vt.ghostty_render_state_get(ctx.state, vt.GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, @as(?*anyopaque, @ptrCast(&ctx.row_iter)));
 
-    // 5. Iterate rows and cells, writing to the back buffer.
+    // 5. Clear the pane bounding box before iterating — mirrors
+    // compositor_blit_ansi. Guarantees a short/torn frame (row iterator
+    // yielding fewer rows than pane_h) can't leave stale cells from a
+    // previous blit.
+    {
+        const pw: usize = @intCast(pane_w);
+        const ph: usize = @intCast(pane_h);
+        const ox: usize = @intCast(pane_x);
+        const oy: usize = @intCast(pane_y);
+        for (0..ph) |row| {
+            const clear_y = oy + row;
+            if (clear_y >= c.height) break;
+            const row_start = clear_y * c.width + ox;
+            const row_end = clear_y * c.width + @min(ox + pw, c.width);
+            if (row_start >= row_end) break;
+            @memset(c.back[row_start..row_end], Cell{});
+        }
+    }
+
+    // 6. Iterate rows and cells, writing to the back buffer.
     var row_idx: usize = 0;
     while (vt.ghostty_render_state_row_iterator_next(ctx.row_iter)) {
         if (row_idx >= @as(usize, @intCast(pane_h))) break;
@@ -336,7 +355,10 @@ export fn ext_blit_ghostty(
 
                 if (w == 2) {
                     const spacer_x = abs_x + 1;
-                    if (spacer_x < c.width) {
+                    // Bound the spacer to both the compositor AND the pane —
+                    // a wide glyph in the pane's last column must not bleed
+                    // into the adjacent pane/sidebar.
+                    if (spacer_x < c.width and col_idx + 1 < @as(usize, @intCast(pane_w))) {
                         c.back[abs_y * c.width + spacer_x] = .{
                             .codepoint = ' ',
                             .fg = fg_color,

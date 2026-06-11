@@ -88,6 +88,46 @@ func lookupTerminal(id uintptr) *Terminal {
 	return registry[id]
 }
 
+// ptrRegistry maps raw C terminal handles (as returned by UnsafePointer) back
+// to their owning *Terminal. The compositor's blit path receives only the raw
+// pointer across the CGo boundary; this registry lets it acquire the
+// terminal's mutex before reading cell state, so blits cannot tear against
+// concurrent WriteVT calls from the PTY reader goroutine.
+var (
+	ptrRegistryMu sync.Mutex
+	ptrRegistry   = map[unsafe.Pointer]*Terminal{}
+)
+
+// LockByPointer acquires the mutex of the Terminal whose raw C handle equals
+// ptr. It returns false (without holding any lock) if the pointer is unknown
+// or the terminal has been closed. On true, the caller must release the lock
+// with UnlockByPointer(ptr) when done.
+func LockByPointer(ptr unsafe.Pointer) bool {
+	ptrRegistryMu.Lock()
+	t := ptrRegistry[ptr]
+	ptrRegistryMu.Unlock()
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	if t.terminal == nil {
+		// Closed between lookup and lock — guard against use-after-free.
+		t.mu.Unlock()
+		return false
+	}
+	return true
+}
+
+// UnlockByPointer releases the mutex acquired by a successful LockByPointer.
+func UnlockByPointer(ptr unsafe.Pointer) {
+	ptrRegistryMu.Lock()
+	t := ptrRegistry[ptr]
+	ptrRegistryMu.Unlock()
+	if t != nil {
+		t.mu.Unlock()
+	}
+}
+
 //export goWritePTYCallback
 func goWritePTYCallback(userdata unsafe.Pointer, data *C.uint8_t, length C.size_t) {
 	id := uintptr(userdata)
@@ -163,6 +203,10 @@ func New(cols, rows int) (*Terminal, error) {
 		C.ghostty_terminal_free(t.terminal)
 		return nil, fmt.Errorf("ghostty_formatter_terminal_new failed: %d", res)
 	}
+
+	ptrRegistryMu.Lock()
+	ptrRegistry[unsafe.Pointer(t.terminal)] = t
+	ptrRegistryMu.Unlock()
 
 	return t, nil
 }
@@ -553,7 +597,8 @@ func (t *Terminal) IsKittyKeyboardModeActive() bool {
 
 // UnsafePointer returns the raw C GhosttyTerminal handle for direct use
 // by the compositor's blit path. The caller must hold the terminal's mutex
-// or ensure exclusive access.
+// or ensure exclusive access; code that only has the raw pointer can use
+// LockByPointer/UnlockByPointer to do so.
 func (t *Terminal) UnsafePointer() unsafe.Pointer {
 	return unsafe.Pointer(t.terminal)
 }
@@ -655,6 +700,9 @@ func (t *Terminal) Close() {
 		t.keyEncoder = nil
 	}
 	if t.terminal != nil {
+		ptrRegistryMu.Lock()
+		delete(ptrRegistry, unsafe.Pointer(t.terminal))
+		ptrRegistryMu.Unlock()
 		C.ghostty_terminal_free(t.terminal)
 		t.terminal = nil
 	}
