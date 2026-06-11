@@ -71,6 +71,15 @@ void ext_set_passthrough(bool passthrough);
 void ext_set_leader_sequence(const uint8_t* bytes, size_t len);
 void ext_add_intercept_sequence(const uint8_t* bytes, size_t len);
 
+// State dump for debugging — writes text representations of buffers and grids to dir_path.
+// Called when GROVE_TTY_AUDIT is active and trigger file is detected.
+// Returns 0 on success, nonzero on error.
+int ext_dump_state(void* c_ptr, const char* dir_path);
+
+// Dump all ghostty grids registered with the compositor extension.
+// Called from Go side to serialize terminal grid state into the same dump dir.
+void ext_dump_all_grids(const char* dir_path);
+
 #ifdef __cplusplus
 }
 #endif

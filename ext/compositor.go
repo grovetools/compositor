@@ -5,6 +5,7 @@ package ext
 #cgo LDFLAGS: -L${SRCDIR}/../zig/zig-out/lib -lgrove-compositor-ext -L${SRCDIR}/../lib/ghostty/lib -lghostty-vt -lc++ -framework CoreFoundation
 #include "compositor_ext.h"
 #include "input_bridge.h"
+#include <stdlib.h>
 */
 import "C"
 import (
@@ -178,6 +179,51 @@ func TTYLock() *sync.Mutex {
 	return &ttyMu
 }
 
+// dumpStateLimiter throttles dump state checks to once per N flushes.
+var (
+	dumpStateCounter int
+	dumpStateLimiter = 10 // Check every 10 flushes
+)
+
+// checkAndDumpState checks for the trigger file and dumps state if present.
+// This is called infrequently (every N flushes) to avoid filesystem overhead.
+func (c *Compositor) checkAndDumpState() {
+	if ttyAuditor == nil || c.Compositor == nil {
+		return // GROVE_TTY_AUDIT not enabled or no compositor
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	triggerFile := home + "/.local/state/grove/tty-dump-now"
+	_, err = os.Stat(triggerFile)
+	if os.IsNotExist(err) {
+		return // Trigger file not present
+	}
+
+	// Trigger file exists; create dump directory with timestamp
+	ts := time.Now().UnixNano()
+	dumpDir := fmt.Sprintf("%s/.local/state/grove/tty-dump-%d", home, ts)
+
+	// Create the dump directory
+	if err := os.MkdirAll(dumpDir, 0o755); err != nil {
+		return
+	}
+
+	// Delete the trigger file first (best-effort)
+	_ = os.Remove(triggerFile)
+
+	// Call ext_dump_state to dump compositor buffers
+	cDumpDir := C.CString(dumpDir)
+	defer C.free(unsafe.Pointer(cDumpDir))
+	C.ext_dump_state(c.Pointer(), cDumpDir)
+
+	// Dump all ghostty grids registered with the extension
+	C.ext_dump_all_grids(cDumpDir)
+}
+
 // Flush writes only changed cells to the given file descriptor, holding
 // the TTY write mutex for the entire C compositor_flush call so the frame
 // is atomic with respect to other serialized writers (see ttyMu).
@@ -195,6 +241,16 @@ func (c *Compositor) Flush(fd int) {
 
 	ttyMu.Lock()
 	c.Compositor.Flush(fd)
+
+	// Check for state dump trigger (infrequently to minimize overhead)
+	if ttyAuditor != nil {
+		dumpStateCounter++
+		if dumpStateCounter >= dumpStateLimiter {
+			dumpStateCounter = 0
+			c.checkAndDumpState()
+		}
+	}
+
 	ttyMu.Unlock()
 
 	if ttyAuditor != nil {

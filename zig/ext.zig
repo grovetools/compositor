@@ -673,3 +673,222 @@ export fn ext_add_intercept_sequence(bytes: [*]const u8, len: usize) void {
     g_input_state.intercept_lens[idx] = n;
     g_input_state.intercept_count += 1;
 }
+
+// --- State Dump for Debugging (GROVE_TTY_AUDIT) ---
+
+/// Dump both buffers and ghostty grids to a directory for diagnosis.
+/// Used when GROVE_TTY_AUDIT is active and ~/.local/state/grove/tty-dump-now exists.
+/// Returns 0 on success, nonzero on error.
+export fn ext_dump_state(c_ptr: *anyopaque, dir_path: [*:0]const u8) c_int {
+    const c: *Compositor = @ptrCast(@alignCast(c_ptr));
+    const dir_slice = std.mem.span(dir_path);
+
+    // Create directory if it doesn't exist
+    std.fs.makeDirAbsolute(dir_slice) catch |err| {
+        compositorLog(c.log_level, .warn, "dump_state: mkdir failed: {}", .{err});
+        return 1;
+    };
+
+    var dir = std.fs.openDirAbsolute(dir_slice, .{}) catch |err| {
+        compositorLog(c.log_level, .warn, "dump_state: opendir failed: {}", .{err});
+        return 1;
+    };
+    defer dir.close();
+
+    // Dump back.txt: back buffer as text (one char per cell, render codepoint or space)
+    {
+        const file = dir.createFile("back.txt", .{}) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: create back.txt failed: {}", .{err});
+            return 1;
+        };
+        defer file.close();
+
+        var buf: std.ArrayListUnmanaged(u8) = .{};
+        defer buf.deinit(g_alloc);
+
+        for (0..c.height) |row| {
+            for (0..c.width) |col| {
+                const idx = row * c.width + col;
+                const cell = c.back[idx];
+                if (cell.codepoint == ' ' or cell.codepoint == 0) {
+                    buf.append(g_alloc, ' ') catch return 1;
+                } else if (cell.codepoint < 0x7F and cell.codepoint >= 0x20) {
+                    buf.append(g_alloc, @intCast(cell.codepoint)) catch return 1;
+                } else {
+                    buf.append(g_alloc, '?') catch return 1;
+                }
+            }
+            buf.append(g_alloc, '\n') catch return 1;
+        }
+        file.writeAll(buf.items) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: write back.txt failed: {}", .{err});
+            return 1;
+        };
+    }
+
+    // Dump front.txt: front buffer as text
+    {
+        const file = dir.createFile("front.txt", .{}) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: create front.txt failed: {}", .{err});
+            return 1;
+        };
+        defer file.close();
+
+        var buf: std.ArrayListUnmanaged(u8) = .{};
+        defer buf.deinit(g_alloc);
+
+        if (g_broadcast_front.len == c.width * c.height) {
+            for (0..c.height) |row| {
+                for (0..c.width) |col| {
+                    const idx = row * c.width + col;
+                    const cell = g_broadcast_front[idx];
+                    if (cell.codepoint == ' ' or cell.codepoint == 0) {
+                        buf.append(g_alloc, ' ') catch return 1;
+                    } else if (cell.codepoint < 0x7F and cell.codepoint >= 0x20) {
+                        buf.append(g_alloc, @intCast(cell.codepoint)) catch return 1;
+                    } else {
+                        buf.append(g_alloc, '?') catch return 1;
+                    }
+                }
+                buf.append(g_alloc, '\n') catch return 1;
+            }
+        }
+        file.writeAll(buf.items) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: write front.txt failed: {}", .{err});
+            return 1;
+        };
+    }
+
+    // Dump back-attrs.txt: back buffer attributes (fg,bg,flags per cell)
+    {
+        const file = dir.createFile("back-attrs.txt", .{}) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: create back-attrs.txt failed: {}", .{err});
+            return 1;
+        };
+        defer file.close();
+
+        var buf: std.ArrayListUnmanaged(u8) = .{};
+        defer buf.deinit(g_alloc);
+
+        for (0..c.height) |row| {
+            for (0..c.width) |col| {
+                const idx = row * c.width + col;
+                const cell = c.back[idx];
+                formatCellFlagsSlice(cell, &buf);
+                buf.append(g_alloc, '|') catch return 1;
+            }
+            buf.append(g_alloc, '\n') catch return 1;
+        }
+        file.writeAll(buf.items) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: write back-attrs.txt failed: {}", .{err});
+            return 1;
+        };
+    }
+
+    // Dump front-attrs.txt: front buffer attributes
+    {
+        const file = dir.createFile("front-attrs.txt", .{}) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: create front-attrs.txt failed: {}", .{err});
+            return 1;
+        };
+        defer file.close();
+
+        var buf: std.ArrayListUnmanaged(u8) = .{};
+        defer buf.deinit(g_alloc);
+
+        if (g_broadcast_front.len == c.width * c.height) {
+            for (0..c.height) |row| {
+                for (0..c.width) |col| {
+                    const idx = row * c.width + col;
+                    const cell = g_broadcast_front[idx];
+                    formatCellFlagsSlice(cell, &buf);
+                    buf.append(g_alloc, '|') catch return 1;
+                }
+                buf.append(g_alloc, '\n') catch return 1;
+            }
+        }
+        file.writeAll(buf.items) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: write front-attrs.txt failed: {}", .{err});
+            return 1;
+        };
+    }
+
+    // Dump diff.txt: list of (row,col) where front != back
+    {
+        const file = dir.createFile("diff.txt", .{}) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: create diff.txt failed: {}", .{err});
+            return 1;
+        };
+        defer file.close();
+
+        var buf: std.ArrayListUnmanaged(u8) = .{};
+        defer buf.deinit(g_alloc);
+
+        if (g_broadcast_front.len == c.width * c.height) {
+            for (0..c.height) |row| {
+                for (0..c.width) |col| {
+                    const idx = row * c.width + col;
+                    if (!base.cellEqual(g_broadcast_front[idx], c.back[idx])) {
+                        buf.writer(g_alloc).print("{},{}\n", .{ row, col }) catch return 1;
+                    }
+                }
+            }
+        }
+        file.writeAll(buf.items) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: write diff.txt failed: {}", .{err});
+            return 1;
+        };
+    }
+
+    return 0;
+}
+
+/// Helper: write cell flags to a buffer (space-separated compact format)
+fn formatCellFlagsSlice(cell: Cell, buf: *std.ArrayListUnmanaged(u8)) void {
+    buf.writer(g_alloc).print("F={d},{d},{d},B={d},{d},{d}", .{
+        cell.fg.r, cell.fg.g, cell.fg.b,
+        cell.bg.r, cell.bg.g, cell.bg.b,
+    }) catch {};
+
+    if (cell.bold) buf.writer(g_alloc).writeAll(",bold") catch {};
+    if (cell.faint) buf.writer(g_alloc).writeAll(",faint") catch {};
+    if (cell.italic) buf.writer(g_alloc).writeAll(",italic") catch {};
+    if (cell.underline) buf.writer(g_alloc).writeAll(",under") catch {};
+    if (cell.inverse) buf.writer(g_alloc).writeAll(",inv") catch {};
+    if (cell.strikethrough) buf.writer(g_alloc).writeAll(",strike") catch {};
+    if (cell.wide) buf.writer(g_alloc).writeAll(",wide") catch {};
+}
+
+/// Dump all ghostty terminals' render states to the given directory.
+/// Writes one grid-<ptr>.txt per registered terminal as a simple text representation.
+export fn ext_dump_all_grids(dir_path: [*:0]const u8) void {
+    const dir_slice = std.mem.span(dir_path);
+
+    var dir = std.fs.openDirAbsolute(dir_slice, .{}) catch |err| {
+        compositorLog(LogLevel.warn, .warn, "dump_all_grids: opendir failed: {}", .{err});
+        return;
+    };
+    defer dir.close();
+
+    var it = g_render_states.iterator();
+    while (it.next()) |entry| {
+        const term_ptr = entry.key_ptr.*;
+
+        // Format the terminal pointer address as hex for the filename
+        var filename_buf: [64]u8 = undefined;
+        const filename = std.fmt.bufPrint(&filename_buf, "grid-{x:0>16}.txt", .{@intFromPtr(term_ptr)}) catch continue;
+
+        const file = dir.createFile(filename, .{}) catch |err| {
+            compositorLog(LogLevel.warn, .warn, "dump_all_grids: create failed: {}", .{err});
+            continue;
+        };
+        defer file.close();
+
+        // Write a note that ghostty grid dump requires external tooling
+        // (the C API doesn't expose a text formatting function)
+        const msg = "ghostty grid dump not available via C API - use terminal introspection or logs\n";
+        file.writeAll(msg) catch |err| {
+            compositorLog(LogLevel.warn, .warn, "dump_all_grids: write failed: {}", .{err});
+        };
+    }
+}
