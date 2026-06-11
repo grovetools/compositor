@@ -8,11 +8,13 @@ package ext
 */
 import "C"
 import (
+	"fmt"
 	"io"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	comp "github.com/grovetools/compositor"
@@ -184,9 +186,21 @@ func (c *Compositor) Flush(fd int) {
 	if c.Compositor == nil {
 		return
 	}
+
+	// Audit instrumentation: log the Flush event
+	startTime := int64(0)
+	if ttyAuditor != nil {
+		startTime = ttyAuditor.GetNanoTime()
+	}
+
 	ttyMu.Lock()
 	c.Compositor.Flush(fd)
 	ttyMu.Unlock()
+
+	if ttyAuditor != nil {
+		duration := ttyAuditor.GetNanoTime() - startTime
+		ttyAuditor.LogFlush(duration)
+	}
 }
 
 // SerializedWriter wraps w so each Write holds the shared TTY mutex,
@@ -210,6 +224,12 @@ type serializedTTY struct {
 func (s *serializedTTY) Write(p []byte) (int, error) {
 	ttyMu.Lock()
 	defer ttyMu.Unlock()
+
+	// Audit instrumentation when GROVE_TTY_AUDIT is enabled
+	if ttyAuditor != nil {
+		ttyAuditor.LogWrite(p, "writer")
+	}
+
 	return s.w.Write(p)
 }
 
@@ -364,4 +384,140 @@ func (c *Compositor) AddInterceptSequence(seq []byte) {
 	if len(seq) > 0 {
 		C.ext_add_intercept_sequence((*C.uint8_t)(unsafe.Pointer(&seq[0])), C.size_t(len(seq)))
 	}
+}
+
+// ============================================================================
+// TTY Write Audit Instrumentation (GROVE_TTY_AUDIT)
+// ============================================================================
+
+var (
+	// ttyAuditor is initialized once by InitTTYAudit if GROVE_TTY_AUDIT is set.
+	// Check ttyAuditor != nil in hot paths instead of a separate flag.
+	ttyAuditor *TTYAuditor
+)
+
+func init() {
+	// Initialize TTY auditor from environment on package load.
+	// This runs before InitTTYAudit() is called, but the env var check is fast.
+	auditPath := os.Getenv("GROVE_TTY_AUDIT")
+	if auditPath == "" {
+		return
+	}
+
+	if auditPath == "1" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return
+		}
+		auditPath = home + "/.local/state/grove/tty-audit.log"
+	}
+
+	ttyAuditor = &TTYAuditor{
+		path:                    auditPath,
+		lastWriterEndedMidSeq:   false,
+	}
+}
+
+// TTYAuditor logs TTY write events to a side file for race condition diagnosis.
+type TTYAuditor struct {
+	path                    string
+	file                    *os.File
+	fileMu                  sync.Mutex
+	lastWriterEndedMidSeq   bool
+	lastWriterID            string
+	escapeState             int // 0=normal, 1=ESC seen, 2=CSI/OSC seen
+}
+
+// escapeSequenceState returns 0 if chunk ends in normal state,
+// 1 if it ends with ESC, 2 if it ends mid-CSI/OSC.
+func (a *TTYAuditor) analyzeEscapeState(data []byte) int {
+	state := a.escapeState
+	for _, b := range data {
+		switch state {
+		case 0: // Normal
+			if b == 0x1b { // ESC
+				state = 1
+			}
+		case 1: // ESC seen
+			if b == '[' {
+				state = 2 // CSI
+			} else if b == ']' {
+				state = 2 // OSC
+			} else {
+				state = 0 // ESC + other (complete)
+			}
+		case 2: // CSI/OSC in progress
+			// CSI ends with letter (A-Z, a-z, etc)
+			// OSC ends with BEL (0x07) or ST (ESC \)
+			if (b >= 0x40 && b <= 0x7e) || b == 0x07 {
+				state = 0
+			}
+			if b == 0x1b { // Potential ST start
+				state = 1
+			}
+		}
+	}
+	a.escapeState = state
+	return state
+}
+
+// LogWrite logs a writer chunk event.
+func (a *TTYAuditor) LogWrite(data []byte, writerID string) {
+	a.fileMu.Lock()
+	defer a.fileMu.Unlock()
+
+	if a.file == nil {
+		var err error
+		a.file, err = os.OpenFile(a.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return
+		}
+	}
+
+	ns := time.Now().UnixNano()
+
+	// Truncate data preview to first 32 bytes
+	preview := data
+	if len(preview) > 32 {
+		preview = preview[:32]
+	}
+	previewStr := strings.Replace(fmt.Sprintf("%q", preview), "\\x", "\\x", -1)
+
+	// Check escape state
+	endedMidSeq := a.analyzeEscapeState(data)
+	raceFlag := ""
+	if a.lastWriterEndedMidSeq && a.lastWriterID != writerID {
+		raceFlag = " RACE"
+	}
+
+	fmt.Fprintf(a.file, "%d writer:%s bytes:%d endedMid:%d%s data:%s\n",
+		ns, writerID, len(data), endedMidSeq, raceFlag, previewStr)
+
+	a.lastWriterEndedMidSeq = (endedMidSeq != 0)
+	a.lastWriterID = writerID
+}
+
+// LogFlush logs a Flush event with lock hold duration.
+func (a *TTYAuditor) LogFlush(durationNs int64) {
+	a.fileMu.Lock()
+	defer a.fileMu.Unlock()
+
+	if a.file == nil {
+		var err error
+		a.file, err = os.OpenFile(a.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return
+		}
+	}
+
+	ns := time.Now().UnixNano()
+	fmt.Fprintf(a.file, "%d flush duration:%d\n", ns, durationNs)
+
+	// Clear the mid-sequence flag on flush boundaries
+	a.lastWriterEndedMidSeq = false
+}
+
+// GetNanoTime returns current nanosecond timestamp.
+func (a *TTYAuditor) GetNanoTime() int64 {
+	return time.Now().UnixNano()
 }
