@@ -51,7 +51,11 @@ $(GHOSTTY_LIB) $(GHOSTTY_HEADER):
 	@sed 's/break :options .{};/break :options .{ .log_level = .err };/' \
 		$(GHOSTTY_BUILD_DIR)/src/lib_vt.zig > $(GHOSTTY_BUILD_DIR)/src/lib_vt.zig.tmp && \
 		mv $(GHOSTTY_BUILD_DIR)/src/lib_vt.zig.tmp $(GHOSTTY_BUILD_DIR)/src/lib_vt.zig
-	@cd $(GHOSTTY_BUILD_DIR) && zig build -Demit-lib-vt=true -Doptimize=ReleaseFast
+	@# -Demit-xcframework=false: the xcframework step needs full Xcode (xcodebuild);
+	@# the Command Line Tools stub passes ghostty's PATH check but can't run, and
+	@# only the static lib + headers are consumed here. (Re-applies wt 436dbad,
+	@# which was lost when 0642c14 was authored without it.)
+	@cd $(GHOSTTY_BUILD_DIR) && zig build -Demit-lib-vt=true -Demit-xcframework=false -Doptimize=ReleaseFast
 	@cp $(GHOSTTY_BUILD_DIR)/zig-out/lib/libghostty-vt.a $(VENDOR_DIR)/lib/
 	@cp -R $(GHOSTTY_BUILD_DIR)/zig-out/include/ghostty $(VENDOR_DIR)/include/
 	@echo "libghostty-vt installed in $(VENDOR_DIR)"
