@@ -61,6 +61,16 @@ pub const Compositor = struct {
     cursor_y: i32 = 0,
     cursor_style: i32 = 0,
     cursor_visible: bool = false,
+    // Last cursor state actually emitted by flush, so idle ticks with an
+    // unchanged cursor write nothing at all (previously the unconditional
+    // cursor block made every flush a non-empty write — with synchronized
+    // output bracketing, that forced the host terminal to commit a frame
+    // per tick and caused visible flashing while typing).
+    emitted_cursor_x: i32 = -1,
+    emitted_cursor_y: i32 = -1,
+    emitted_cursor_style: i32 = -1,
+    emitted_cursor_visible: bool = false,
+    emitted_cursor_valid: bool = false,
 };
 
 // --- Lifecycle exports ---
@@ -353,8 +363,15 @@ export fn compositor_flush(c: *Compositor, fd: c_int) void {
         }
     }
 
-    // Append cursor sequences at the very end.
-    {
+    // Append cursor sequences only when cells were repainted (the repaint
+    // may have moved the physical cursor / painted over it) or the cursor
+    // state changed since the last emit. Idle ticks write nothing.
+    const cursor_changed = !c.emitted_cursor_valid or
+        c.emitted_cursor_x != c.cursor_x or
+        c.emitted_cursor_y != c.cursor_y or
+        c.emitted_cursor_style != c.cursor_style or
+        c.emitted_cursor_visible != c.cursor_visible;
+    if (dirty_count > 0 or cursor_changed) {
         const writer = out.writer(alloc);
         if (!c.cursor_visible) {
             writer.writeAll("\x1b[?25l") catch @panic("OOM");
@@ -366,6 +383,11 @@ export fn compositor_flush(c: *Compositor, fd: c_int) void {
             // DECTCEM: show cursor.
             writer.writeAll("\x1b[?25h") catch @panic("OOM");
         }
+        c.emitted_cursor_x = c.cursor_x;
+        c.emitted_cursor_y = c.cursor_y;
+        c.emitted_cursor_style = c.cursor_style;
+        c.emitted_cursor_visible = c.cursor_visible;
+        c.emitted_cursor_valid = true;
     }
 
     const bytes_out: u64 = out.items.len;
