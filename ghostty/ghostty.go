@@ -173,11 +173,20 @@ type Terminal struct {
 	deferSince  time.Time
 	vtTail      [16]byte
 	vtTailLen   int
+
+	// Pane-input recording (GROVE_PTY_CAPTURE) — see input_capture.go.
+	inRecs  [][]byte
+	inBytes int
+	inCap   int
 }
 
 // New creates a new ghostty terminal with the given dimensions.
 func New(cols, rows int) (*Terminal, error) {
 	t := &Terminal{cols: cols, rows: rows}
+	if c := inputCaptureCapFromEnv(); c > 0 {
+		t.inCap = c
+		t.appendInputLocked(inputRecKindResize, inputResizePayload(cols, rows))
+	}
 
 	opts := C.GhosttyTerminalOptions{
 		cols:           C.uint16_t(cols),
@@ -248,6 +257,9 @@ func (t *Terminal) WriteVT(data []byte) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.inCap > 0 {
+		t.appendInputLocked(inputRecKindBytes, data)
+	}
 	C.ghostty_terminal_vt_write(t.terminal, (*C.uint8_t)(unsafe.Pointer(&data[0])), C.size_t(len(data)))
 	t.lastWrite = time.Now()
 	t.scanSyncOutput(data)
@@ -523,6 +535,9 @@ func (t *Terminal) Resize(cols, rows int) {
 	defer t.mu.Unlock()
 	t.cols = cols
 	t.rows = rows
+	if t.inCap > 0 {
+		t.appendInputLocked(inputRecKindResize, inputResizePayload(cols, rows))
+	}
 	C.ghostty_terminal_resize(t.terminal, C.uint16_t(cols), C.uint16_t(rows), 1, 1)
 }
 
@@ -814,6 +829,7 @@ func DumpAllGrids(dir string) {
 		text := t.FormatScreenPlain()
 		name := fmt.Sprintf("%s/grid-%016x.txt", dir, uintptr(p))
 		_ = os.WriteFile(name, []byte(text), 0o644)
+		t.dumpInputCapture(dir, uintptr(p))
 	}
 }
 
