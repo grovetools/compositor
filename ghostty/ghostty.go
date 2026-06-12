@@ -169,6 +169,8 @@ type Terminal struct {
 	// would never show — torn content and mid-frame cursor positions.
 	syncActive  bool
 	syncStarted time.Time
+	lastWrite   time.Time
+	deferSince  time.Time
 	vtTail      [16]byte
 	vtTailLen   int
 }
@@ -247,6 +249,7 @@ func (t *Terminal) WriteVT(data []byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	C.ghostty_terminal_vt_write(t.terminal, (*C.uint8_t)(unsafe.Pointer(&data[0])), C.size_t(len(data)))
+	t.lastWrite = time.Now()
 	t.scanSyncOutput(data)
 }
 
@@ -837,4 +840,42 @@ func logSyncEvent(kind string, t *Terminal) {
 		return
 	}
 	fmt.Fprintf(syncDebugF, "%d sync:%s term:%p\n", time.Now().UnixNano(), kind, t.terminal)
+}
+
+// Frame-settling debounce: a TUI paints a frame as a burst of writes; a
+// blit landing inside the burst samples a half-drawn frame (torn content,
+// mid-frame cursor) whether or not the app uses synchronized output. A
+// pane is "settled" when its PTY has been quiet for settleQuiet. The
+// starvation cap bounds deferral for continuously-streaming panes (tail -f
+// etc.) so they still render, at worst sampling mid-stream as before.
+const (
+	settleQuiet   = 8 * time.Millisecond
+	settleMaxWait = 50 * time.Millisecond
+)
+
+// SettledByPointer reports whether the terminal's PTY stream has been quiet
+// long enough to blit a (probably) complete frame, or has been deferred so
+// long that we blit anyway.
+func SettledByPointer(ptr unsafe.Pointer) bool {
+	ptrRegistryMu.Lock()
+	t := ptrRegistry[ptr]
+	ptrRegistryMu.Unlock()
+	if t == nil {
+		return true
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.lastWrite.IsZero() || time.Since(t.lastWrite) >= settleQuiet {
+		t.deferSince = time.Time{}
+		return true
+	}
+	if t.deferSince.IsZero() {
+		t.deferSince = time.Now()
+		return false
+	}
+	if time.Since(t.deferSince) >= settleMaxWait {
+		t.deferSince = time.Time{}
+		return true // starvation cap: render mid-stream rather than never
+	}
+	return false
 }

@@ -2,6 +2,7 @@ package ext_test
 
 import (
 	"testing"
+	"time"
 	"unsafe"
 
 	ext "github.com/grovetools/compositor/ext"
@@ -19,6 +20,7 @@ func TestCursorVisibilityTracksDECTCEM(t *testing.T) {
 	ptr := unsafe.Pointer(term.UnsafePointer())
 
 	term.WriteVT([]byte("hello\x1b[5;10H")) // position cursor
+	time.Sleep(12 * time.Millisecond)       // settle quiet window
 	c.BlitGhostty(ptr, 0, 0, 80, 24)        // updates render state
 	ci := c.GetCursor(ptr)
 	t.Logf("shown: visible=%v x=%d y=%d style=%d", ci.Visible, ci.X, ci.Y, ci.Style)
@@ -27,6 +29,7 @@ func TestCursorVisibilityTracksDECTCEM(t *testing.T) {
 	}
 
 	term.WriteVT([]byte("\x1b[?25l")) // DECTCEM hide
+	time.Sleep(12 * time.Millisecond)
 	c.BlitGhostty(ptr, 0, 0, 80, 24)
 	ci = c.GetCursor(ptr)
 	t.Logf("after ?25l: visible=%v x=%d y=%d", ci.Visible, ci.X, ci.Y)
