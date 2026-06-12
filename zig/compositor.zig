@@ -79,6 +79,11 @@ pub const Compositor = struct {
     // frames bracketed in DEC 2026 the rewrite is visually atomic, making
     // this invisible insurance. ~600 flushes ≈ 10s at the 60Hz tick.
     flushes_since_heal: u32 = 0,
+    // Classic mode: disable outbound 2026 bracketing and periodic
+    // self-heal (set from Go via compositor_set_classic when
+    // GROVE_COMPOSITOR_CLASSIC=1) — escape hatch to yesterday's
+    // rendering behavior.
+    classic: bool = false,
 };
 
 const heal_interval: u32 = 600;
@@ -161,6 +166,10 @@ export fn compositor_resize(c: *Compositor, width: c_int, height: c_int) void {
 
 // --- Cursor ---
 
+export fn compositor_set_classic(c: *Compositor, classic: bool) void {
+    c.classic = classic;
+}
+
 export fn compositor_set_cursor(c: *Compositor, x: c_int, y: c_int, style: c_int, visible: bool) void {
     c.cursor_x = @intCast(x);
     c.cursor_y = @intCast(y);
@@ -240,7 +249,7 @@ export fn compositor_flush(c: *Compositor, fd: c_int) void {
     // Periodic self-heal: poison the front buffer so this flush rewrites
     // the entire screen (see flushes_since_heal).
     c.flushes_since_heal += 1;
-    if (c.flushes_since_heal >= heal_interval) {
+    if (!c.classic and c.flushes_since_heal >= heal_interval) {
         c.flushes_since_heal = 0;
         @memset(c.front, Cell{ .codepoint = 0xFFFFFFFF });
         c.emitted_cursor_valid = false;
@@ -412,13 +421,15 @@ export fn compositor_flush(c: *Compositor, fd: c_int) void {
     const bytes_out: u64 = out.items.len;
     if (bytes_out > 0) {
         const file: std.posix.fd_t = @intCast(fd);
-        // Bracket the frame in DEC 2026 synchronized output so terminals
-        // that support it (Ghostty, iTerm2, kitty, ...) apply the whole
-        // diff atomically instead of rendering at arbitrary chunk
-        // boundaries. Terminals without support ignore the sequences.
-        _ = std.posix.write(file, "\x1b[?2026h") catch {};
-        _ = std.posix.write(file, out.items) catch {};
-        _ = std.posix.write(file, "\x1b[?2026l") catch {};
+        if (c.classic) {
+            _ = std.posix.write(file, out.items) catch {};
+        } else {
+            // Bracket the frame in DEC 2026 synchronized output so the
+            // host terminal applies the whole diff atomically.
+            _ = std.posix.write(file, "\x1b[?2026h") catch {};
+            _ = std.posix.write(file, out.items) catch {};
+            _ = std.posix.write(file, "\x1b[?2026l") catch {};
+        }
     }
 
     // Update stats.

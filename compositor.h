@@ -34,6 +34,7 @@ void compositor_blit_ansi(Compositor* c, int x, int y, int w, int h,
 
 // Cursor
 void compositor_set_cursor(Compositor* c, int x, int y, int style, bool visible);
+void compositor_set_classic(Compositor* c, bool classic);
 
 // Output
 void compositor_flush(Compositor* c, int fd);

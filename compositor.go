@@ -77,9 +77,17 @@ type Compositor struct {
 // New creates a compositor with the given screen dimensions.
 // logLevel is passed to the Zig side (0=trace, 1=debug, 2=info, 3=warn, 4=error).
 func New(width, height, logLevel int) *Compositor {
-	return &Compositor{
+	c := &Compositor{
 		ptr: C.compositor_new(C.int(width), C.int(height), C.int(logLevel)),
 	}
+	// GROVE_COMPOSITOR_CLASSIC=1 reverts rendering to pre-2026 behavior
+	// (no outbound frame bracketing, no periodic self-heal) — escape
+	// hatch while the synchronized-output interaction with the host
+	// terminal is being tuned.
+	if os.Getenv("GROVE_COMPOSITOR_CLASSIC") != "" && c.ptr != nil {
+		C.compositor_set_classic(c.ptr, C.bool(true))
+	}
+	return c
 }
 
 // Free releases all compositor resources.
