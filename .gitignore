@@ -1,3 +1,4 @@
 zig/.zig-cache/
 zig/zig-out/
 lib/ghostty/
+zig/zig-out-linux/
