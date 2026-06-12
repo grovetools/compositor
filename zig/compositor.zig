@@ -371,7 +371,13 @@ export fn compositor_flush(c: *Compositor, fd: c_int) void {
     const bytes_out: u64 = out.items.len;
     if (bytes_out > 0) {
         const file: std.posix.fd_t = @intCast(fd);
+        // Bracket the frame in DEC 2026 synchronized output so terminals
+        // that support it (Ghostty, iTerm2, kitty, ...) apply the whole
+        // diff atomically instead of rendering at arbitrary chunk
+        // boundaries. Terminals without support ignore the sequences.
+        _ = std.posix.write(file, "\x1b[?2026h") catch {};
         _ = std.posix.write(file, out.items) catch {};
+        _ = std.posix.write(file, "\x1b[?2026l") catch {};
     }
 
     // Update stats.
