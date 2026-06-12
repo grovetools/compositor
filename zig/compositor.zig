@@ -71,7 +71,17 @@ pub const Compositor = struct {
     emitted_cursor_style: i32 = -1,
     emitted_cursor_visible: bool = false,
     emitted_cursor_valid: bool = false,
+    // Self-heal cadence: every heal_interval flushes the front buffer is
+    // poisoned, forcing a complete rewrite of the physical screen. The
+    // terminal is write-only — we can never VERIFY the glass matches the
+    // front buffer — so any silent divergence (emulator bugs, lost bytes)
+    // would otherwise persist until a manual full repaint. With flush
+    // frames bracketed in DEC 2026 the rewrite is visually atomic, making
+    // this invisible insurance. ~600 flushes ≈ 10s at the 60Hz tick.
+    flushes_since_heal: u32 = 0,
 };
+
+const heal_interval: u32 = 600;
 
 // --- Lifecycle exports ---
 
@@ -226,6 +236,15 @@ fn emitBgColor(writer: anytype, color: ansi.Color, sgr_needed: bool) bool {
 
 export fn compositor_flush(c: *Compositor, fd: c_int) void {
     const start_ns = std.time.nanoTimestamp();
+
+    // Periodic self-heal: poison the front buffer so this flush rewrites
+    // the entire screen (see flushes_since_heal).
+    c.flushes_since_heal += 1;
+    if (c.flushes_since_heal >= heal_interval) {
+        c.flushes_since_heal = 0;
+        @memset(c.front, Cell{ .codepoint = 0xFFFFFFFF });
+        c.emitted_cursor_valid = false;
+    }
 
     const alloc = c.allocator;
     var out: std.ArrayList(u8) = .{};
