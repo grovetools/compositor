@@ -39,6 +39,16 @@ void compositor_set_classic(Compositor* c, bool classic);
 // Output
 void compositor_flush(Compositor* c, int fd);
 
+// Rendering-debug instrumentation: when enabled, every buffer flush writes
+// to the fd is first passed to the Go groveCompositorRecord export
+// (output recording ring + verification VT). Global, off by default.
+void compositor_set_recording(bool enabled);
+
+// Restore the rect's last-flushed content (front buffer) into the back
+// buffer — used by hosts to keep a deferred pane's previous frame on
+// screen instead of the chrome blit's pre-cleared blanks.
+void compositor_copy_front_to_back(Compositor* c, int x, int y, int w, int h);
+
 // Stats
 typedef struct {
     uint64_t frames_rendered;

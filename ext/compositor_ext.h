@@ -71,6 +71,15 @@ void ext_set_passthrough(bool passthrough);
 void ext_set_leader_sequence(const uint8_t* bytes, size_t len);
 void ext_add_intercept_sequence(const uint8_t* bytes, size_t len);
 
+// Verification compare — codepoint-compare the given terminal's grid (the
+// verification VT fed our own output stream) against the flush front buffer.
+// Returns 0 on full match, 1 on mismatch with the first differing cell in
+// the out params. The caller must guarantee the terminal is not being
+// written concurrently (the verification VT is only touched under the
+// host's TTY lock).
+int ext_compare_front(void* c_ptr, void* term, int* out_row, int* out_col,
+                      uint32_t* out_front_cp, uint32_t* out_term_cp);
+
 // State dump for debugging — writes text representations of buffers and grids to dir_path.
 // Called when GROVE_TTY_AUDIT is active and trigger file is detected.
 // Returns 0 on success, nonzero on error.

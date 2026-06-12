@@ -132,6 +132,9 @@ export fn ext_free() void {
         g_broadcast_front = &.{};
     }
     g_diff_buf.deinit(g_alloc);
+    // Reset to empty: deinit leaves the struct pointing at freed memory,
+    // and a later ext_init + ext_free cycle would double-free it.
+    g_diff_buf = .{};
 
     g_initialized = false;
 }
@@ -383,6 +386,85 @@ export fn ext_blit_ghostty(
     _ = vt.ghostty_render_state_set(ctx.state, vt.GHOSTTY_RENDER_STATE_OPTION_DIRTY, &clean_state);
 
     compositorLog(c.log_level, .debug, "blit_ghostty: rows={d} pane=({d},{d} {d}x{d})", .{ row_idx, pane_x, pane_y, pane_w, pane_h });
+}
+
+// ext_compare_front codepoint-compares a terminal's grid against the flush
+// front buffer (c.front). The terminal is the verification VT: a second
+// libghostty-vt instance fed the exact byte stream we wrote to the host
+// terminal — a conformant emulator's screen must equal the front buffer,
+// so any mismatch is a real front-vs-glass divergence at the moment it
+// happens. Returns 0 on full match, 1 with the first differing cell.
+//
+// Comparison semantics: codepoints only (attribute divergence is possible
+// but content divergence is the symptom under investigation); 0 and ' '
+// compare equal (flush emits ' ' for both); front wide_spacer cells and
+// never-flushed sentinel cells (0xFFFFFFFF) are skipped. Rows the iterator
+// doesn't yield are not compared (no false positives on short viewports).
+// The caller guarantees the terminal is quiescent (verification VT is only
+// written under the host's TTY lock, which the caller holds).
+export fn ext_compare_front(
+    c_ptr: *anyopaque,
+    term_ptr: ?*anyopaque,
+    out_row: *c_int,
+    out_col: *c_int,
+    out_front_cp: *u32,
+    out_term_cp: *u32,
+) c_int {
+    const c: *Compositor = @ptrCast(@alignCast(c_ptr));
+    const term: vt.GhosttyTerminal = @ptrCast(term_ptr);
+
+    const ctx_entry = g_render_states.getOrPut(term_ptr) catch return 0;
+    if (!ctx_entry.found_existing) {
+        var state: vt.GhosttyRenderState = null;
+        var row_iter: vt.GhosttyRenderStateRowIterator = null;
+        var cells: vt.GhosttyRenderStateRowCells = null;
+
+        _ = vt.ghostty_render_state_new(null, &state);
+        _ = vt.ghostty_render_state_row_iterator_new(null, &row_iter);
+        _ = vt.ghostty_render_state_row_cells_new(null, &cells);
+
+        ctx_entry.value_ptr.* = .{ .state = state, .row_iter = row_iter, .cells = cells };
+    }
+    const ctx = ctx_entry.value_ptr;
+
+    _ = vt.ghostty_render_state_update(ctx.state, term);
+    _ = vt.ghostty_render_state_get(ctx.state, vt.GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, @as(?*anyopaque, @ptrCast(&ctx.row_iter)));
+
+    var row_idx: usize = 0;
+    while (vt.ghostty_render_state_row_iterator_next(ctx.row_iter)) {
+        if (row_idx >= c.height) break;
+        _ = vt.ghostty_render_state_row_get(ctx.row_iter, vt.GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, @as(?*anyopaque, @ptrCast(&ctx.cells)));
+
+        var col_idx: usize = 0;
+        while (vt.ghostty_render_state_row_cells_next(ctx.cells)) {
+            if (col_idx >= c.width) break;
+
+            var grapheme_len: u32 = 0;
+            _ = vt.ghostty_render_state_row_cells_get(ctx.cells, vt.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, &grapheme_len);
+            var cp: u32 = ' ';
+            if (grapheme_len > 0) {
+                var codepoints: [16]u32 = undefined;
+                _ = vt.ghostty_render_state_row_cells_get(ctx.cells, vt.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, &codepoints);
+                cp = codepoints[0];
+            }
+
+            const idx = row_idx * c.width + col_idx;
+            const f = c.front[idx];
+            const skip = f.wide_spacer or f.codepoint == 0xFFFFFFFF;
+            const f_cp: u32 = if (f.codepoint == 0) ' ' else f.codepoint;
+            const t_cp: u32 = if (cp == 0) ' ' else cp;
+            if (!skip and f_cp != t_cp) {
+                out_row.* = @intCast(row_idx);
+                out_col.* = @intCast(col_idx);
+                out_front_cp.* = f.codepoint;
+                out_term_cp.* = cp;
+                return 1;
+            }
+            col_idx += 1;
+        }
+        row_idx += 1;
+    }
+    return 0;
 }
 
 export fn ext_unregister_terminal(term: ?*anyopaque) void {
@@ -730,10 +812,74 @@ export fn ext_dump_state(c_ptr: *anyopaque, dir_path: [*:0]const u8) c_int {
         };
     }
 
-    // Dump front.txt: front buffer as text
+    // Dump front_flush.txt: the BASE front buffer (c.front) — the only
+    // model of the physical screen (what compositor_flush diffed against
+    // and updated). This was historically missing: front.txt held the
+    // broadcast mirror, so "front==back" claims exonerated nothing.
+    // Sentinel (never-flushed) cells render as '!'.
     {
-        const file = dir.createFile("front.txt", .{}) catch |err| {
-            compositorLog(c.log_level, .warn, "dump_state: create front.txt failed: {}", .{err});
+        const file = dir.createFile("front_flush.txt", .{}) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: create front_flush.txt failed: {}", .{err});
+            return 1;
+        };
+        defer file.close();
+
+        var buf: std.ArrayListUnmanaged(u8) = .{};
+        defer buf.deinit(g_alloc);
+
+        for (0..c.height) |row| {
+            for (0..c.width) |col| {
+                const idx = row * c.width + col;
+                const cell = c.front[idx];
+                if (cell.codepoint == 0xFFFFFFFF) {
+                    buf.append(g_alloc, '!') catch return 1;
+                } else if (cell.codepoint == ' ' or cell.codepoint == 0) {
+                    buf.append(g_alloc, ' ') catch return 1;
+                } else if (cell.codepoint < 0x7F and cell.codepoint >= 0x20) {
+                    buf.append(g_alloc, @intCast(cell.codepoint)) catch return 1;
+                } else {
+                    buf.append(g_alloc, '?') catch return 1;
+                }
+            }
+            buf.append(g_alloc, '\n') catch return 1;
+        }
+        file.writeAll(buf.items) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: write front_flush.txt failed: {}", .{err});
+            return 1;
+        };
+    }
+
+    // Dump diff_flush.txt: (row,col) where the flush front buffer differs
+    // from back — the cells the NEXT flush would write.
+    {
+        const file = dir.createFile("diff_flush.txt", .{}) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: create diff_flush.txt failed: {}", .{err});
+            return 1;
+        };
+        defer file.close();
+
+        var buf: std.ArrayListUnmanaged(u8) = .{};
+        defer buf.deinit(g_alloc);
+
+        for (0..c.height) |row| {
+            for (0..c.width) |col| {
+                const idx = row * c.width + col;
+                if (!base.cellEqual(c.front[idx], c.back[idx])) {
+                    buf.writer(g_alloc).print("{},{}\n", .{ row, col }) catch return 1;
+                }
+            }
+        }
+        file.writeAll(buf.items) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: write diff_flush.txt failed: {}", .{err});
+            return 1;
+        };
+    }
+
+    // Dump front_broadcast.txt: the SSE delta-protocol mirror
+    // (g_broadcast_front) — formerly misleadingly named front.txt.
+    {
+        const file = dir.createFile("front_broadcast.txt", .{}) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: create front_broadcast.txt failed: {}", .{err});
             return 1;
         };
         defer file.close();
@@ -758,7 +904,7 @@ export fn ext_dump_state(c_ptr: *anyopaque, dir_path: [*:0]const u8) c_int {
             }
         }
         file.writeAll(buf.items) catch |err| {
-            compositorLog(c.log_level, .warn, "dump_state: write front.txt failed: {}", .{err});
+            compositorLog(c.log_level, .warn, "dump_state: write front_broadcast.txt failed: {}", .{err});
             return 1;
         };
     }
@@ -789,10 +935,10 @@ export fn ext_dump_state(c_ptr: *anyopaque, dir_path: [*:0]const u8) c_int {
         };
     }
 
-    // Dump front-attrs.txt: front buffer attributes
+    // Dump front_broadcast-attrs.txt: broadcast mirror attributes
     {
-        const file = dir.createFile("front-attrs.txt", .{}) catch |err| {
-            compositorLog(c.log_level, .warn, "dump_state: create front-attrs.txt failed: {}", .{err});
+        const file = dir.createFile("front_broadcast-attrs.txt", .{}) catch |err| {
+            compositorLog(c.log_level, .warn, "dump_state: create front_broadcast-attrs.txt failed: {}", .{err});
             return 1;
         };
         defer file.close();
@@ -812,7 +958,7 @@ export fn ext_dump_state(c_ptr: *anyopaque, dir_path: [*:0]const u8) c_int {
             }
         }
         file.writeAll(buf.items) catch |err| {
-            compositorLog(c.log_level, .warn, "dump_state: write front-attrs.txt failed: {}", .{err});
+            compositorLog(c.log_level, .warn, "dump_state: write front_broadcast-attrs.txt failed: {}", .{err});
             return 1;
         };
     }

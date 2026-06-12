@@ -58,6 +58,32 @@ func groveCompositorLog(level C.int, msg *C.char, length C.size_t) {
 	}
 }
 
+// SetRecordFunc installs a callback that receives every byte buffer the
+// compositor flush writes to the terminal fd (complete frames, brackets
+// included). Used by the rendering-debug instrumentation in the ext package
+// (output recording ring + verification VT). Pass nil to disable.
+//
+// The callback runs on the flushing goroutine while the host's TTY lock is
+// held — it must be fast and must never write to the tty or take a lock
+// that can wait on a tty writer.
+func SetRecordFunc(fn func([]byte)) {
+	recordFunc = fn
+	C.compositor_set_recording(C.bool(fn != nil))
+}
+
+var recordFunc func([]byte)
+
+// groveCompositorRecord is the CGo export called from the Zig flush with
+// the frame it is about to write. Gated Zig-side by compositor_set_recording
+// so disabled runs pay zero cgo-callback cost.
+//
+//export groveCompositorRecord
+func groveCompositorRecord(data *C.uint8_t, length C.size_t) {
+	if recordFunc != nil && length > 0 {
+		recordFunc(C.GoBytes(unsafe.Pointer(data), C.int(length)))
+	}
+}
+
 // Stats holds compositor performance metrics read from the Zig side.
 type Stats struct {
 	FramesRendered    uint64
@@ -125,6 +151,17 @@ func (c *Compositor) SetCursor(x, y, style int, visible bool) {
 func (c *Compositor) Flush(fd int) {
 	if c.ptr != nil {
 		C.compositor_flush(c.ptr, C.int(fd))
+	}
+}
+
+// CopyFrontToBack restores the rect's last-flushed content (front buffer)
+// into the back buffer, making the rect diff-neutral for the next flush.
+// Sentinel (never-flushed) cells are skipped. Hosts use this to keep a
+// deferred pane's previous frame on screen after the chrome blit pre-cleared
+// its interior.
+func (c *Compositor) CopyFrontToBack(x, y, w, h int) {
+	if c.ptr != nil {
+		C.compositor_copy_front_to_back(c.ptr, C.int(x), C.int(y), C.int(w), C.int(h))
 	}
 }
 

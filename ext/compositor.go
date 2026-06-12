@@ -96,9 +96,12 @@ type Compositor struct {
 }
 
 // New creates a compositor with the given screen dimensions and initializes
-// the extension state (ghostty cache, diff buffers, input state).
+// the extension state (ghostty cache, diff buffers, input state) plus the
+// rendering-evidence instruments when GROVE_TTY_CAPTURE / GROVE_TTY_SHADOW
+// are set.
 func New(width, height, logLevel int) *Compositor {
 	C.ext_init()
+	initEvidence(width, height)
 	return &Compositor{
 		Compositor: comp.New(width, height, logLevel),
 	}
@@ -118,6 +121,26 @@ func Resize(c *Compositor, width, height int) {
 	if c.Compositor != nil {
 		c.Compositor.Resize(width, height)
 	}
+	evidenceResize(width, height)
+}
+
+// compareFront compares the given terminal's grid (the verification VT)
+// against the flush front buffer, codepoint-wise. Returns the first
+// mismatching cell. Wide-spacer and never-flushed sentinel cells are
+// skipped; 0 and ' ' compare equal. The verification VT is only ever
+// written and compared under ttyMu, so no terminal lock is taken (taking
+// it here could invert lock order with WriteVT-driven tty writers).
+func (c *Compositor) compareFront(termPtr unsafe.Pointer) (row, col int, frontCp, termCp uint32, mismatch bool) {
+	if c.Compositor == nil || termPtr == nil {
+		return 0, 0, 0, 0, false
+	}
+	var cRow, cCol C.int
+	var cFront, cTerm C.uint32_t
+	res := C.ext_compare_front(c.Pointer(), termPtr, &cRow, &cCol, &cFront, &cTerm)
+	if res == 0 {
+		return 0, 0, 0, 0, false
+	}
+	return int(cRow), int(cCol), uint32(cFront), uint32(cTerm), true
 }
 
 // GetStats returns merged stats from base + extension.
@@ -144,6 +167,13 @@ func (c *Compositor) Clear() {
 	}
 }
 
+// Gate escape hatches for A/B soak comparisons: each blit gate can be
+// disabled independently at startup.
+var (
+	disableSettleGate = os.Getenv("GROVE_COMPOSITOR_NO_SETTLE") != ""
+	disableSyncGate   = os.Getenv("GROVE_COMPOSITOR_NO_SYNC") != ""
+)
+
 // BlitGhostty reads cell data from a ghostty terminal's render state
 // and writes it into the back buffer at the given pane coordinates.
 //
@@ -151,19 +181,26 @@ func (c *Compositor) Clear() {
 // iterates the ghostty cell grid, which is mutated concurrently by WriteVT
 // on the PTY reader goroutine. Without the lock the blit can observe a
 // half-applied VT write (torn cells interleaving two text generations).
+//
+// When a gate defers the blit, the pane's previous frame is restored from
+// the front buffer: the per-tick chrome blit has already pre-cleared the
+// pane interior, and without the restore the next flush would paint blanks
+// over live content — a visible flash on every PTY write burst.
 func (c *Compositor) BlitGhostty(termPtr unsafe.Pointer, x, y, w, h int) {
 	if c.Compositor == nil || termPtr == nil {
 		return
 	}
-	if !ghostty.SettledByPointer(termPtr) {
+	if !disableSettleGate && !ghostty.SettledByPointer(termPtr) {
 		// Mid paint-burst — defer to the next tick for a complete frame
 		// (bounded by the starvation cap; see ghostty.SettledByPointer).
+		c.Compositor.CopyFrontToBack(x, y, w, h)
 		return
 	}
-	if ghostty.SyncActiveByPointer(termPtr) {
+	if !disableSyncGate && ghostty.SyncActiveByPointer(termPtr) {
 		// The app is mid synchronized-output frame (DEC 2026) — real
 		// terminals withhold updates here. Keep the previous complete
 		// frame; the pane's dirty flag re-blits us after ESU.
+		c.Compositor.CopyFrontToBack(x, y, w, h)
 		return
 	}
 	if !ghostty.LockByPointer(termPtr) {
@@ -259,6 +296,9 @@ func (c *Compositor) dumpState() {
 	// Dump all ghostty grids registered with the Go-side registry
 	// (FormatScreenPlain under each terminal's mutex).
 	ghostty.DumpAllGrids(dumpDir)
+
+	// Dump the output recording ring (no-op unless GROVE_TTY_CAPTURE).
+	dumpCapture(dumpDir)
 }
 
 // Flush writes only changed cells to the given file descriptor, holding
@@ -278,6 +318,11 @@ func (c *Compositor) Flush(fd int) {
 
 	ttyMu.Lock()
 	c.Compositor.Flush(fd)
+
+	// Verification VT compare (every verifyInterval flushes; no-op unless
+	// GROVE_TTY_SHADOW). Runs under ttyMu so the VT is quiescent and the
+	// front buffer is post-diff.
+	c.verifyAfterFlush()
 
 	// Check for state dump trigger (infrequently to minimize overhead)
 	if ttyAuditor != nil {
@@ -322,6 +367,11 @@ func (s *serializedTTY) Write(p []byte) (int, error) {
 	if ttyAuditor != nil {
 		ttyAuditor.LogWrite(p, "writer")
 	}
+
+	// Evidence instruments: host-app bytes belong in the recording ring and
+	// the verification VT just like flush frames (we hold ttyMu, so order
+	// matches the fd). No-op unless capture/shadow enabled.
+	recordOutput(p)
 
 	return s.w.Write(p)
 }

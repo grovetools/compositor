@@ -1,6 +1,7 @@
 package ext_test
 
 import (
+	"os"
 	"testing"
 	"time"
 	"unsafe"
@@ -33,14 +34,15 @@ func decodeDiffCodepoints(t *testing.T, payload []byte) map[[2]int]rune {
 	return out
 }
 
-// TestDeferredBlitAfterChromeClearBlanksPane reproduces the per-update pane
-// flash: the tuimux tick does a full-screen BlitANSI (which pre-clears the
-// entire back buffer, including pane interiors) and then re-fills pane
-// interiors via BlitGhostty. Since the settle/sync gates (5a8dd6f / 0d8a381)
-// can skip the BlitGhostty, the pane interior cells stay BLANK in the back
-// buffer for that tick, and the subsequent Flush paints blanks over live pane
-// content on the physical screen — content returns one settle-period later:
-// a visible flash on every PTY write burst, independent of classic mode.
+// TestDeferredBlitAfterChromeClearBlanksPane pins the fix for the per-update
+// pane flash: the tuimux tick does a full-screen BlitANSI (which pre-clears
+// the entire back buffer, including pane interiors) and then re-fills pane
+// interiors via BlitGhostty. The settle/sync gates (5a8dd6f / 0d8a381) can
+// defer the BlitGhostty — originally that left the pane interior BLANK in
+// the back buffer for the tick, and Flush painted blanks over live pane
+// content (a visible flash on every PTY write burst, independent of classic
+// mode). The fix restores the pane rect from the front buffer on deferral,
+// keeping the previous frame on screen; this test asserts the restore.
 func TestDeferredBlitAfterChromeClearBlanksPane(t *testing.T) {
 	term, err := ghostty.New(80, 24)
 	if err != nil {
@@ -52,12 +54,19 @@ func TestDeferredBlitAfterChromeClearBlanksPane(t *testing.T) {
 	c := ext.New(80, 24, 4)
 	defer c.Free()
 
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devnull.Close()
+
 	// The chrome string a real tick blits over the whole screen (mux.go
 	// RenderLayout result): non-empty, paints away from cell (0,0). The
 	// blit pre-clears its entire bounding box before parsing.
 	chrome := "\n\n\n\n\n\n\n\n\nchrome"
 
-	// Tick 1: pane has settled content; blit succeeds.
+	// Tick 1: pane has settled content; blit succeeds; Flush publishes the
+	// frame, so the front buffer holds the pane content (the restore source).
 	term.WriteVT([]byte("\x1b[1;1HHELLO"))
 	time.Sleep(10 * time.Millisecond) // settleQuiet elapsed -> blit runs
 	c.BlitANSI(0, 0, 80, 24, chrome)  // chrome pass (clears whole back buffer)
@@ -66,26 +75,27 @@ func TestDeferredBlitAfterChromeClearBlanksPane(t *testing.T) {
 	if cells[[2]int{0, 0}] != 'H' {
 		t.Fatalf("setup: expected 'H' at (0,0) after settled blit, got %q", cells[[2]int{0, 0}])
 	}
+	c.Flush(int(devnull.Fd()))
 
 	// Tick 2: PTY writes mid-burst; chrome pass clears the back buffer,
-	// then the gated BlitGhostty defers (PTY not settled). The pane region
-	// is now blank in the back buffer — exactly what Flush would write to
-	// the terminal this tick.
+	// then the gated BlitGhostty defers (PTY not settled) and RESTORES the
+	// pane rect from the front buffer. Without the restore this tick's
+	// Flush would write blanks over live pane content — the flash.
 	term.WriteVT([]byte(" WORLD"))   // lastWrite = now -> not settled
 	c.BlitANSI(0, 0, 80, 24, chrome) // chrome pass clears pane interior
 	c.BlitGhostty(ptr, 0, 0, 80, 24)
 	cells = decodeDiffCodepoints(t, c.GetDirtyPayload())
-	if cp, ok := cells[[2]int{0, 0}]; !ok || cp != ' ' {
-		t.Errorf("expected pane cell (0,0) to be blanked while blit deferred (the flash); got %q present=%v", cp, ok)
+	if cp, ok := cells[[2]int{0, 0}]; ok && cp == ' ' {
+		t.Errorf("pane cell (0,0) blanked while blit deferred (the flash regressed); got %q", cp)
 	}
 
-	// Tick 3 (one settle period later): blit runs again, content returns —
-	// the other half of the flash.
+	// Tick 3 (one settle period later): blit runs again with the live grid —
+	// content (now including WORLD) lands normally.
 	time.Sleep(10 * time.Millisecond)
 	c.BlitANSI(0, 0, 80, 24, chrome)
 	c.BlitGhostty(ptr, 0, 0, 80, 24)
 	cells = decodeDiffCodepoints(t, c.GetDirtyPayload())
-	if cells[[2]int{0, 0}] != 'H' {
-		t.Errorf("expected content restored at (0,0) after settle, got %q", cells[[2]int{0, 0}])
+	if cp, ok := cells[[2]int{0, 0}]; ok && cp != 'H' {
+		t.Errorf("expected content at (0,0) after settle, got %q", cp)
 	}
 }

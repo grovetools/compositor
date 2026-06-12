@@ -16,6 +16,19 @@ pub const LogLevel = enum(c_int) {
 // Callback into Go's groveCompositorLog export.
 extern fn groveCompositorLog(level: c_int, msg: [*]const u8, length: usize) void;
 
+// Callback into Go's groveCompositorRecord export: receives every byte
+// buffer flush writes to the terminal fd, for the rendering-debug
+// instrumentation (output recording ring + verification VT). Only invoked
+// when recording was enabled via compositor_set_recording — the Go side
+// sets it when GROVE_TTY_CAPTURE / GROVE_TTY_SHADOW are active.
+extern fn groveCompositorRecord(data: [*]const u8, len: usize) void;
+
+var g_recording: bool = false;
+
+export fn compositor_set_recording(enabled: bool) void {
+    g_recording = enabled;
+}
+
 pub fn compositorLog(min_level: LogLevel, level: LogLevel, comptime fmt_str: []const u8, args: anytype) void {
     if (@intFromEnum(level) < @intFromEnum(min_level)) return;
     var buf: [512]u8 = undefined;
@@ -418,19 +431,23 @@ export fn compositor_flush(c: *Compositor, fd: c_int) void {
         c.emitted_cursor_valid = true;
     }
 
-    const bytes_out: u64 = out.items.len;
-    if (bytes_out > 0) {
-        const file: std.posix.fd_t = @intCast(fd);
-        if (c.classic) {
-            _ = std.posix.write(file, out.items) catch {};
-        } else {
+    if (out.items.len > 0) {
+        if (!c.classic) {
             // Bracket the frame in DEC 2026 synchronized output so the
-            // host terminal applies the whole diff atomically.
-            _ = std.posix.write(file, "\x1b[?2026h") catch {};
-            _ = std.posix.write(file, out.items) catch {};
-            _ = std.posix.write(file, "\x1b[?2026l") catch {};
+            // host terminal applies the whole diff atomically. The brackets
+            // go into the SAME buffer as the payload: one contiguous frame,
+            // one write — a partial write can no longer drop the closing
+            // ESU while the payload landed, and the recording stream sees
+            // complete frames exactly as the kernel does.
+            out.insertSlice(alloc, 0, "\x1b[?2026h") catch @panic("OOM");
+            out.appendSlice(alloc, "\x1b[?2026l") catch @panic("OOM");
         }
+        if (g_recording) {
+            groveCompositorRecord(out.items.ptr, out.items.len);
+        }
+        writeAllChecked(c, @intCast(fd), out.items);
     }
+    const bytes_out: u64 = out.items.len;
 
     // Update stats.
     c.stats.frames_rendered += 1;
@@ -442,6 +459,78 @@ export fn compositor_flush(c: *Compositor, fd: c_int) void {
     }
 
     compositorLog(c.log_level, .debug, "flush: dirty={d} bytes={d}", .{ dirty_count, bytes_out });
+}
+
+// writeAllChecked writes data to fd, retrying partial writes. The front
+// buffer was already updated during diff generation, so any byte the kernel
+// accepts-but-we-don't-confirm would leave front≠glass: the diff believes
+// those cells painted and skips them forever (persistent corruption healed
+// only by a full repaint). std.posix.write retries EINTR internally; a
+// short count is retried here from the new offset; EAGAIN (non-blocking
+// fd / full tty queue) is retried with a 1ms sleep up to eagain_max. On
+// unrecoverable failure the incident is logged ("short write" — grep target
+// for the soak checklist) and the front buffer is invalidated so the next
+// flush re-emits the entire screen.
+fn writeAllChecked(c: *Compositor, fd: std.posix.fd_t, data: []const u8) void {
+    const eagain_max: u32 = 50;
+    var written: usize = 0;
+    var eagain_spins: u32 = 0;
+    while (written < data.len) {
+        const n = std.posix.write(fd, data[written..]) catch |err| {
+            if (err == error.WouldBlock and eagain_spins < eagain_max) {
+                eagain_spins += 1;
+                std.Thread.sleep(1_000_000); // 1ms
+                continue;
+            }
+            compositorLog(c.log_level, .err, "flush: short write {d}/{d} ({s})", .{ written, data.len, @errorName(err) });
+            invalidateFront(c);
+            return;
+        };
+        if (n == 0) {
+            compositorLog(c.log_level, .err, "flush: short write {d}/{d} (zero-byte write)", .{ written, data.len });
+            invalidateFront(c);
+            return;
+        }
+        written += n;
+        eagain_spins = 0;
+    }
+}
+
+// invalidateFront poisons the front buffer so the next flush diffs every
+// cell and rewrites the full screen, recovering whatever the failed write
+// dropped. Also forgets the emitted cursor state and resets the self-heal
+// countdown (the invalidation IS a heal).
+fn invalidateFront(c: *Compositor) void {
+    @memset(c.front, Cell{ .codepoint = 0xFFFFFFFF });
+    c.emitted_cursor_valid = false;
+    c.flushes_since_heal = 0;
+}
+
+// compositor_copy_front_to_back restores the rect's last-flushed content
+// (front buffer) into the back buffer. Used when a pane blit is deferred by
+// the settle/sync gates: the per-tick chrome blit has already pre-cleared
+// the pane interior, and without this restore the next flush paints blanks
+// over live pane content — the per-update flash. Restoring front makes the
+// rect diff-neutral (front==back ⇒ flush emits nothing for it). Sentinel
+// cells (0xFFFFFFFF: never flushed, or just invalidated) are skipped.
+export fn compositor_copy_front_to_back(c: *Compositor, x: c_int, y: c_int, w: c_int, h: c_int) void {
+    if (x < 0 or y < 0 or w <= 0 or h <= 0) return;
+    const ox: usize = @intCast(x);
+    const oy: usize = @intCast(y);
+    const pw: usize = @intCast(w);
+    const ph: usize = @intCast(h);
+    for (0..ph) |row| {
+        const yy = oy + row;
+        if (yy >= c.height) break;
+        const x_end = @min(ox + pw, c.width);
+        if (ox >= x_end) break;
+        for (ox..x_end) |xx| {
+            const idx = yy * c.width + xx;
+            const f = c.front[idx];
+            if (f.codepoint == 0xFFFFFFFF) continue;
+            c.back[idx] = f;
+        }
+    }
 }
 
 // --- ANSI blit ---
