@@ -779,6 +779,7 @@ func (t *Terminal) Cols() int {
 
 // Close frees all ghostty resources.
 func (t *Terminal) Close() {
+	freeMouseEncoder(t)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.renderInited {
