@@ -155,6 +155,12 @@ func (c *Compositor) BlitGhostty(termPtr unsafe.Pointer, x, y, w, h int) {
 	if c.Compositor == nil || termPtr == nil {
 		return
 	}
+	if ghostty.SyncActiveByPointer(termPtr) {
+		// The app is mid synchronized-output frame (DEC 2026) — real
+		// terminals withhold updates here. Keep the previous complete
+		// frame; the pane's dirty flag re-blits us after ESU.
+		return
+	}
 	if !ghostty.LockByPointer(termPtr) {
 		return // unknown or closed terminal
 	}

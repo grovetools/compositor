@@ -46,10 +46,12 @@ static GhosttyPoint make_screen_point(uint16_t x, uint32_t y) {
 import "C"
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/mattn/go-runewidth"
@@ -157,6 +159,18 @@ type Terminal struct {
 	rowIter      C.GhosttyRenderStateRowIterator
 	rowCells     C.GhosttyRenderStateRowCells
 	renderInited bool
+
+	// Synchronized-output (DEC private mode 2026) tracking. Real terminals
+	// withhold display updates between BSU (CSI ? 2026 h) and ESU
+	// (CSI ? 2026 l) so applications can paint frames atomically. The
+	// vendored libghostty-vt does not track this mode, so we detect the
+	// sequences in WriteVT; the compositor blit skips terminals mid-sync,
+	// otherwise it samples (and paints) half-drawn frames a real terminal
+	// would never show — torn content and mid-frame cursor positions.
+	syncActive  bool
+	syncStarted time.Time
+	vtTail      [16]byte
+	vtTailLen   int
 }
 
 // New creates a new ghostty terminal with the given dimensions.
@@ -233,6 +247,70 @@ func (t *Terminal) WriteVT(data []byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	C.ghostty_terminal_vt_write(t.terminal, (*C.uint8_t)(unsafe.Pointer(&data[0])), C.size_t(len(data)))
+	t.scanSyncOutput(data)
+}
+
+// bsuSeq/esuSeq are the DEC 2026 begin/end synchronized update sequences.
+var (
+	bsuSeq = []byte("\x1b[?2026h")
+	esuSeq = []byte("\x1b[?2026l")
+)
+
+// scanSyncOutput updates the mode-2026 state from a VT chunk. A small tail
+// of the previous chunk is retained so sequences split across PTY reads are
+// still recognized. Caller holds t.mu.
+func (t *Terminal) scanSyncOutput(data []byte) {
+	// Stitch tail + data (only the joint region needs the tail).
+	var joint []byte
+	if t.vtTailLen > 0 {
+		joint = make([]byte, 0, t.vtTailLen+min(len(data), len(bsuSeq)))
+		joint = append(joint, t.vtTail[:t.vtTailLen]...)
+		joint = append(joint, data[:min(len(data), len(bsuSeq))]...)
+	}
+
+	lastBSU := bytes.LastIndex(data, bsuSeq)
+	lastESU := bytes.LastIndex(data, esuSeq)
+	if lastBSU == -1 && lastESU == -1 && joint != nil {
+		lastBSU = bytes.LastIndex(joint, bsuSeq)
+		lastESU = bytes.LastIndex(joint, esuSeq)
+	}
+	if lastBSU > lastESU {
+		t.syncActive = true
+		t.syncStarted = time.Now()
+	} else if lastESU > lastBSU {
+		t.syncActive = false
+	}
+
+	// Retain the new tail.
+	n := min(len(data), len(t.vtTail))
+	copy(t.vtTail[:], data[len(data)-n:])
+	t.vtTailLen = n
+}
+
+// syncTimeout bounds how long a BSU without ESU can suppress display
+// updates — the same safety valve real terminals apply.
+const syncTimeout = 150 * time.Millisecond
+
+// SyncActiveByPointer reports whether the terminal with the given raw C
+// handle is inside a synchronized-output frame (mode 2026). The compositor
+// blit uses this to skip sampling half-painted frames.
+func SyncActiveByPointer(ptr unsafe.Pointer) bool {
+	ptrRegistryMu.Lock()
+	t := ptrRegistry[ptr]
+	ptrRegistryMu.Unlock()
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.syncActive {
+		return false
+	}
+	if time.Since(t.syncStarted) > syncTimeout {
+		t.syncActive = false
+		return false
+	}
+	return true
 }
 
 // FormatScreen returns the current terminal screen as a VT-encoded string.
