@@ -275,9 +275,15 @@ func (t *Terminal) scanSyncOutput(data []byte) {
 		lastESU = bytes.LastIndex(joint, esuSeq)
 	}
 	if lastBSU > lastESU {
+		if !t.syncActive {
+			logSyncEvent("BSU", t)
+		}
 		t.syncActive = true
 		t.syncStarted = time.Now()
 	} else if lastESU > lastBSU {
+		if t.syncActive {
+			logSyncEvent("ESU", t)
+		}
 		t.syncActive = false
 	}
 
@@ -806,4 +812,29 @@ func DumpAllGrids(dir string) {
 		name := fmt.Sprintf("%s/grid-%016x.txt", dir, uintptr(p))
 		_ = os.WriteFile(name, []byte(text), 0o644)
 	}
+}
+
+// syncDebugFile is the diagnostic sink for mode-2026 transitions, active
+// only under GROVE_TTY_AUDIT. Answers "does this app emit synchronized
+// output at all?" without a PTY byte recorder.
+var (
+	syncDebugOnce sync.Once
+	syncDebugF    *os.File
+)
+
+func logSyncEvent(kind string, t *Terminal) {
+	syncDebugOnce.Do(func() {
+		if os.Getenv("GROVE_TTY_AUDIT") == "" {
+			return
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return
+		}
+		syncDebugF, _ = os.OpenFile(home+"/.local/state/grove/tty-audit.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	})
+	if syncDebugF == nil {
+		return
+	}
+	fmt.Fprintf(syncDebugF, "%d sync:%s term:%p\n", time.Now().UnixNano(), kind, t.terminal)
 }
